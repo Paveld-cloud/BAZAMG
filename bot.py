@@ -14,63 +14,30 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен из переменных окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7574993294:AAGcnWNkh_A10JSaxDi0m4KjSKtSQgIdPuk")
+# Токен бота
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7574993294:...")
 
-# Читаем таблицу и нормализуем названия столбцов
+# Читаем таблицу
 df = pd.read_excel("data.xlsx")
 df.columns = df.columns.str.strip().str.lower()
 
-# Храним состояние (последний запрос, смещение) по user_id
+# Хранение состояния поиска: {user_id: {"query": ..., "offset": ..., "results": DataFrame}}
 user_state = {}
 
-# /start — очищаем историю и приветствуем
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Сбрасываем состояние
-    if user_id in user_state:
-        user_state.pop(user_id)
+    # Полностью очищаем состояние
+    user_state.pop(user_id, None)
     await update.message.reply_text(
-        "Привет! История поиска очищена.\nОтправь тип или наименование детали."
+        "Привет! История поиска очищена.\n"
+        "Отправьте тип или наименование детали для нового поиска."
     )
 
-# /more — продолжение выдачи результатов
-async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = user_state.get(user_id)
-    if not state:
-        await update.message.reply_text("Сначала выполните поиск.")
-        return
-
-    query, offset, results = state["query"], state["offset"], state["results"]
-    # Показываем следующую порцию
-    page = results.iloc[offset: offset + 5]
-    for _, row in page.iterrows():
-        text = (
-            f"🔹 Тип: {row['тип']}\n"
-            f"📦 Наименование: {row['наименование']}\n"
-            f"🔢 Код: {row['код']}\n"
-            f"📦 Кол-во: {row['количество']}\n"
-            f"💰 Цена: {row['цена']} {row['валюта']}\n"
-            f"🏭 Изготовитель: {row['изготовитель']}\n"
-            f"⚙ OEM: {row['oem']}"
-        )
-        await update.message.reply_text(text)
-
-    # Обновляем смещение
-    new_offset = offset + 5
-    user_state[user_id]["offset"] = new_offset
-    if new_offset < len(results):
-        await update.message.reply_text("Напишите /more для следующих результатов.")
-    else:
-        await update.message.reply_text("Больше результатов нет.")
-
-# Обработка любых текстовых сообщений — поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
 
-    # Фильтр по столбцам
+    # Фильтр по 'тип' и 'наименование'
     mask = (
         df['тип'].str.lower().str.contains(query, na=False) |
         df['наименование'].str.lower().str.contains(query, na=False)
@@ -81,16 +48,34 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'По запросу "{query}" ничего не найдено.')
         return
 
-    # Сохраняем состояние
+    # Сохраняем новое состояние: стартовая страница 0–5
     user_state[user_id] = {
         "query": query,
-        "offset": 5,
+        "offset": 0,
         "results": results
     }
 
-    # Выдаём первые 5
-    for _, row in results.head(5).iterrows():
-        text = (
+    # Отправляем первую порцию
+    await send_page(update, user_id)
+
+async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+
+    if not state:
+        await update.message.reply_text("Сначала отправьте запрос для поиска (/start чтобы очистить).")
+        return
+
+    await send_page(update, user_id)
+
+async def send_page(update: Update, user_id: int):
+    state = user_state[user_id]
+    results = state["results"]
+    offset = state["offset"]
+    chunk = results.iloc[offset : offset + 5]
+
+    for _, row in chunk.iterrows():
+        await update.message.reply_text(
             f"🔹 Тип: {row['тип']}\n"
             f"📦 Наименование: {row['наименование']}\n"
             f"🔢 Код: {row['код']}\n"
@@ -99,22 +84,21 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏭 Изготовитель: {row['изготовитель']}\n"
             f"⚙ OEM: {row['oem']}"
         )
-        await update.message.reply_text(text)
 
-    if len(results) > 5:
-        await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
+    # Обновляем offset
+    state["offset"] += 5
+
+    # Если ещё есть результаты
+    if state["offset"] < len(results):
+        await update.message.reply_text("Напишите /more для следующих результатов.")
+    else:
+        await update.message.reply_text("Больше результатов нет.")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("more", more))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
-
-    logger.info("Бот запущен")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
 
     logger.info("Бот запущен")
     app.run_polling()
