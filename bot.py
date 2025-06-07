@@ -96,7 +96,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ещё", more))
+    app.add_handler(CommandHandler("more", more))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
 
     logger.info("Бот запущен")
