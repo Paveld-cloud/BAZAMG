@@ -30,7 +30,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # Основная функция
 def main():
-    TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # ← вставь сюда свой токен
+    TOKEN = '7574993294:AAGcnWNkh_A10JSaxDi0m4KjSKtSQgIdPuk'  # ← вставь сюда свой токен
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
