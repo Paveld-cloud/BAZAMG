@@ -1,7 +1,7 @@
 import logging
 import pandas as pd
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 # Загрузка Excel-файла
 df = pd.read_excel('data.xlsx')
@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Обработчик текстовых сообщений
-def search(update: Update, context: CallbackContext) -> None:
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.message.text.lower()
     results = df[df.apply(
         lambda row: query in str(row['Тип']).lower() or query in str(row['Название']).lower(),
@@ -22,20 +22,26 @@ def search(update: Update, context: CallbackContext) -> None:
     )]
 
     if results.empty:
-        update.message.reply_text('Ничего не найдено.')
+        await update.message.reply_text('Ничего не найдено.')
     else:
         for _, row in results.iterrows():
-            update.message.reply_text(f"""Тип: {row['Тип']}
+            await update.message.reply_text(f"""Тип: {row['Тип']}
 Название: {row['Название']}""")
 
 # Основная функция
-def main():
-    TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # ← замени на свой токен
-    updater = Updater(TOKEN)
-    dispatcher = updater.dispatcher
+async def main():
+    TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # ← вставь свой токен
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    # Обработка обычных сообщений
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, search))
+    # Обработка текстовых сообщений
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+
+    await app.run_polling()
+
+# Точка входа
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
 
     updater.start_polling()
     updater.idle()
