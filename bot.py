@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Читаем токен из переменных окружения (или вставьте строкой)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7574993294:AAGcnWNkh_A10JSaxDi0m4KjSKtSQgIdPuk")
 
 # Загружаем и нормализуем колонки
 df = pd.read_excel("data.xlsx")
@@ -94,10 +94,16 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напишите /ещё для следующих результатов.")
 
 def main():
-    app = ApplicationBuilder().token(7574993294:AAGcnWNkh_A10JSaxDi0m4KjSKtSQgIdPuk).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ещё", more))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+
+    logger.info("Бот запущен")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
     logger.info("Бот запущен")
     app.run_polling()
