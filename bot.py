@@ -29,22 +29,14 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 Название: {row['Название']}""")
 
 # Основная функция
-async def main():
-    TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # ← вставь свой токен
+def main():
+    TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # ← вставь сюда свой токен
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Обработка текстовых сообщений
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
 
-    await app.run_polling()
-
-# Точка входа
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
-
-    updater.start_polling()
-    updater.idle()
+    # Просто запускаем polling (без asyncio.run!)
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
