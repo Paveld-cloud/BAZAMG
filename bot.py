@@ -3,6 +3,7 @@ import os
 import pickle
 import json
 import gspread
+import re
 from google.oauth2.service_account import Credentials
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +14,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from pandas import DataFrame
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -37,18 +39,17 @@ def load_data():
 # Загружаем данные из Google Sheets
 raw_data = load_data()
 
-# Преобразуем в DataFrame-подобную структуру (список словарей)
-from pandas import DataFrame
-
+# Преобразуем в DataFrame
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
-df['код'] = df['код'].astype(str).str.strip().str.lower()
 
-# Храним состояние (последний запрос, смещение) по user_id
+# Приводим поля к строковому виду
+for col in ['тип', 'наименование', 'код', 'oem', 'изготовитель']:
+    df[col] = df[col].astype(str).str.strip().str.lower()
+
 user_state = {}
 search_count = {}
 
-# Загружаем предыдущее состояние, если есть
 if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
@@ -56,12 +57,12 @@ if os.path.exists("state.pkl"):
 def generate_inline_keyboard(code: str):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("\U0001F4D6 История", callback_data=f"history|{code}"),
-            InlineKeyboardButton("\U0001F9FC Уход", callback_data=f"care|{code}"),
+            InlineKeyboardButton("📖 История", callback_data=f"history|{code}"),
+            InlineKeyboardButton("🧼 Уход", callback_data=f"care|{code}"),
         ],
         [
-            InlineKeyboardButton("\U0001F4DD Описание", callback_data=f"description|{code}"),
-            InlineKeyboardButton("\U0001F3A5 Видео", callback_data=f"video|{code}"),
+            InlineKeyboardButton("📝 Описание", callback_data=f"description|{code}"),
+            InlineKeyboardButton("🎥 Видео", callback_data=f"video|{code}"),
         ]
     ])
 
@@ -81,13 +82,13 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = results.iloc[offset: offset + 5]
     for _, row in page.iterrows():
         text = (
-            f"\U0001F539 Тип: {row['тип']}\n"
-            f"\U0001F4E6 Наименование: {row['наименование']}\n"
-            f"\U0001F522 Код: {row['код']}\n"
-            f"\U0001F4E6 Кол-во: {row['количество']}\n"
-            f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
-            f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
-            f"\u2699 OEM: {row['oem']}")
+            f"📍 Тип: {row['тип']}\n"
+            f"📦 Наименование: {row['наименование']}\n"
+            f"🔢 Код: {row['код']}\n"
+            f"📦 Кол-во: {row['количество']}\n"
+            f"💰 Цена: {row['цена']} {row['валюта']}\n"
+            f"🏭 Изготовитель: {row['изготовитель']}\n"
+            f"⚙️ OEM: {row['oem']}")
         await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row['код'])))
 
     new_offset = offset + 5
@@ -99,17 +100,17 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001F4D6 Доступные команды:\n"
+        "📖 Доступные команды:\n"
         "/start — начать заново\n"
-        "/more — показать ещё результаты\n"
+        "/more — показать ещё\n"
         "/help — справка\n"
-        "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
+        "Просто отправьте текст для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"\U0001F50D Вы сделали {count} поисков за сессию.")
+    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import pandas as pd
@@ -128,13 +129,15 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
+    query = re.sub(r"[()]", "", query)
+    query = re.sub(r"\s{2,}", " ", query)
 
     mask = (
-        df['тип'].str.lower().str.contains(query, na=False) |
-        df['наименование'].str.lower().str.contains(query, na=False) |
+        df['тип'].str.contains(query, na=False) |
+        df['наименование'].str.contains(query, na=False) |
         df['код'].str.contains(query, na=False) |
-        df['oem'].astype(str).str.lower().str.contains(query, na=False) |
-        df['изготовитель'].str.lower().str.contains(query, na=False)
+        df['oem'].str.contains(query, na=False) |
+        df['изготовитель'].str.contains(query, na=False)
     )
     results = df[mask]
 
@@ -153,13 +156,13 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for _, row in results.head(5).iterrows():
         text = (
-            f"\U0001F539 Тип: {row['тип']}\n"
-            f"\U0001F4E6 Наименование: {row['наименование']}\n"
-            f"\U0001F522 Код: {row['код']}\n"
-            f"\U0001F4E6 Кол-во: {row['количество']}\n"
-            f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
-            f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
-            f"\u2699 OEM: {row['oem']}")
+            f"📍 Тип: {row['тип']}\n"
+            f"📦 Наименование: {row['наименование']}\n"
+            f"🔢 Код: {row['код']}\n"
+            f"📦 Кол-во: {row['количество']}\n"
+            f"💰 Цена: {row['цена']} {row['валюта']}\n"
+            f"🏭 Изготовитель: {row['изготовитель']}\n"
+            f"⚙️ OEM: {row['oem']}")
         await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row['код'])))
 
     if len(results) > 5:
@@ -170,17 +173,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     action, item_code = query.data.split("|", 1)
-
-    if action == "history":
-        await query.message.reply_text(f"\U0001F4D6 История детали: {item_code}")
-    elif action == "care":
-        await query.message.reply_text(f"\U0001F9FC Уход за деталью: {item_code}")
-    elif action == "description":
-        await query.message.reply_text(f"\U0001F4DD Описание детали: {item_code}")
-    elif action == "video":
-        await query.message.reply_text(f"\U0001F3A5 Видеообзор: {item_code}")
-    else:
-        await query.message.reply_text("Неизвестное действие.")
+    responses = {
+        "history": f"📖 История детали: {item_code}",
+        "care": f"🧼 Уход за деталью: {item_code}",
+        "description": f"📝 Описание детали: {item_code}",
+        "video": f"🎥 Видеообзор: {item_code}",
+    }
+    await query.message.reply_text(responses.get(action, "Неизвестное действие."))
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Ошибка в Telegram обработчике", exc_info=context.error)
