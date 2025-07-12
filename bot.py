@@ -15,16 +15,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Админы
 ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
 
+# Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 SHEET_NAME = "SAP"
 
+# Загрузка данных из Google Sheets
 def load_data():
     creds_info = json.loads(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -39,11 +43,8 @@ from pandas import DataFrame
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
-df["наименование"] = df["наименование"].astype(str).str.strip().str.lower()
-df["тип"] = df["тип"].astype(str).str.strip().str.lower()
-df["oem"] = df["oem"].astype(str).str.strip().str.lower()
-df["изготовитель"] = df["изготовитель"].astype(str).str.strip().str.lower()
 
+# Состояние пользователя
 user_state = {}
 search_count = {}
 
@@ -129,19 +130,20 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
-    terms = query.split()
+    query_words = re.findall(r"\w+", query)
 
-    def row_matches(row):
-        text = " ".join([
-            str(row["тип"]),
-            str(row["наименование"]),
-            str(row["код"]),
-            str(row["oem"]),
-            str(row["изготовитель"])
-        ]).lower()
-        return all(term in text for term in terms)
+    def normalize(text):
+        return re.sub(r"[^\w]+", "", str(text).lower())
 
-    results = df[df.apply(row_matches, axis=1)]
+    mask = df.apply(
+        lambda row: all(
+            any(normalize(str(cell)).find(word) != -1 for cell in row)
+            for word in query_words
+        ),
+        axis=1
+    )
+
+    results = df[mask]
 
     if results.empty:
         await update.message.reply_text(f'По запросу "{query}" ничего не найдено.')
@@ -196,3 +198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
