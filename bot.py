@@ -3,8 +3,9 @@ import os
 import pickle
 import json
 import gspread
+import re
 from google.oauth2.service_account import Credentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,14 +15,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# 🔒 Админы
-ADMINS = {123456789, 987654321}  # ← сюда добавь свой user_id
-
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Telegram Token и Google Sheets настройки
+# Админы
+ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
+
+# Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
@@ -37,42 +38,46 @@ def load_data():
 
 raw_data = load_data()
 
-# Обработка и нормализация
 from pandas import DataFrame
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
-df["наименование"] = df["наименование"].astype(str).str.strip().str.lower()
 
-# Состояния
+# Состояние пользователя
 user_state = {}
 search_count = {}
-users_set = set()
 
-# Загрузка предыдущих сессий
 if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
-if os.path.exists("users.pkl"):
-    with open("users.pkl", "rb") as f:
-        users_set = pickle.load(f)
-
-# Генерация кнопок
 def generate_inline_keyboard(code: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧾 История", callback_data=f"history|{code}"),
-         InlineKeyboardButton("🧰 Уход", callback_data=f"care|{code}")],
-        [InlineKeyboardButton("📄 Описание", callback_data=f"description|{code}"),
-         InlineKeyboardButton("🎥 Видео", callback_data=f"video|{code}")]
+        [
+            InlineKeyboardButton("📖 История", callback_data=f"history|{code}"),
+            InlineKeyboardButton("🧼 Уход", callback_data=f"care|{code}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Описание", callback_data=f"description|{code}"),
+            InlineKeyboardButton("🎥 Видео", callback_data=f"video|{code}"),
+        ]
     ])
 
-# Команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    users_set.add(user_id)
     user_state.pop(user_id, None)
-    await update.message.reply_text("Привет! Отправь код, OEM или наименование детали для поиска.")
+    await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📘 Команды:\n"
+        "/start — сброс поиска\n"
+        "/more — показать ещё\n"
+        "/help — справка\n"
+        "/export — экспорт результатов\n"
+        "/stats — сколько раз искали\n"
+        "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
+    )
 
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -80,129 +85,111 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state:
         await update.message.reply_text("Сначала выполните поиск.")
         return
-
     query, offset, results = state["query"], state["offset"], state["results"]
     page = results.iloc[offset: offset + 5]
     for _, row in page.iterrows():
-        await update.message.reply_text(
-            format_result(row),
-            reply_markup=generate_inline_keyboard(str(row["код"]))
-        )
-
-    user_state[user_id]["offset"] += 5
-    if user_state[user_id]["offset"] < len(results):
+        text = format_row(row)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
+    offset += 5
+    user_state[user_id]["offset"] = offset
+    if offset < len(results):
         await update.message.reply_text("Напишите /more для следующих результатов.")
     else:
         await update.message.reply_text("Больше результатов нет.")
 
-def format_result(row):
+def format_row(row):
     return (
-        f"📦 Тип: {row['тип']}\n"
-        f"🏷️ Наименование: {row['наименование']}\n"
-        f"🆔 Код: {row['код']}\n"
+        f"🔹 Тип: {row['тип']}\n"
+        f"📦 Наименование: {row['наименование']}\n"
+        f"🔢 Код: {row['код']}\n"
         f"📦 Кол-во: {row['количество']}\n"
-        f"💵 Цена: {row['цена']} {row['валюта']}\n"
+        f"💰 Цена: {row['цена']} {row['валюта']}\n"
         f"🏭 Изготовитель: {row['изготовитель']}\n"
         f"⚙️ OEM: {row['oem']}"
     )
 
+async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from pandas import ExcelWriter
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+    if not state:
+        await update.message.reply_text("Сначала выполните поиск.")
+        return
+    filename = f"export_{user_id}.xlsx"
+    state["results"].to_excel(filename, index=False)
+    with open(filename, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename))
+    os.remove(filename)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = search_count.get(user_id, 0)
+    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    users_set.add(user_id)
     query = update.message.text.strip().lower()
+    escaped_query = re.escape(query)
 
     mask = (
-        df["тип"].str.contains(query, na=False) |
-        df["наименование"].str.contains(query, na=False) |
-        df["код"].str.contains(query, na=False) |
-        df["oem"].astype(str).str.contains(query, na=False) |
-        df["изготовитель"].str.contains(query, na=False)
+        df["тип"].str.lower().str.contains(escaped_query, na=False, regex=True) |
+        df["наименование"].str.lower().str.contains(escaped_query, na=False, regex=True) |
+        df["код"].str.contains(escaped_query, na=False, regex=True) |
+        df["oem"].astype(str).str.lower().str.contains(escaped_query, na=False, regex=True) |
+        df["изготовитель"].str.lower().str.contains(escaped_query, na=False, regex=True)
     )
     results = df[mask]
 
     if results.empty:
-        await update.message.reply_text(f"По запросу «{query}» ничего не найдено.")
+        await update.message.reply_text(f'По запросу "{query}" ничего не найдено.')
         return
 
-    user_state[user_id] = {"query": query, "offset": 5, "results": results}
     search_count[user_id] = search_count.get(user_id, 0) + 1
+    user_state[user_id] = {
+        "query": query,
+        "offset": 5,
+        "results": results
+    }
 
     for _, row in results.head(5).iterrows():
-        await update.message.reply_text(format_result(row), reply_markup=generate_inline_keyboard(str(row["код"])))
+        text = format_row(row)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
 
-# Обработка кнопок
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, code = query.data.split("|", 1)
-
-    text_map = {
-        "history": f"🧾 История детали: {code}",
-        "care": f"🧰 Уход за деталью: {code}",
-        "description": f"📄 Описание детали: {code}",
-        "video": f"🎥 Видеообзор: {code}"
+    action, item_code = query.data.split("|", 1)
+    messages = {
+        "history": f"📖 История детали: {item_code}",
+        "care": f"🧼 Уход за деталью: {item_code}",
+        "description": f"📝 Описание детали: {item_code}",
+        "video": f"🎥 Видеообзор: {item_code}"
     }
-    await query.message.reply_text(text_map.get(action, "Неизвестное действие."))
+    await query.message.reply_text(messages.get(action, "Неизвестное действие."))
 
-# 👑 Админ-панель
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        await update.message.reply_text("⛔ Доступ запрещён.")
-        return
-
-    text = (
-        "🔧 Админ-панель:\n"
-        f"👥 Пользователей: {len(users_set)}\n"
-        f"🔍 Всего поисков: {sum(search_count.values())}\n"
-        "📤 Напишите /broadcast <сообщение> для рассылки"
-    )
-    await update.message.reply_text(text)
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        await update.message.reply_text("⛔ Доступ запрещён.")
-        return
-
-    message = " ".join(context.args)
-    count = 0
-    for uid in users_set:
-        try:
-            await context.bot.send_message(chat_id=uid, text=f"📢 {message}")
-            count += 1
-        except:
-            continue
-    await update.message.reply_text(f"✅ Разослано {count} пользователям.")
-
-# Ошибки
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка", exc_info=context.error)
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
-# Запуск
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("more", more))
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+    app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
-
+    logger.info("Бот запущен")
     app.run_polling()
 
-    # Сохраняем состояние
     with open("state.pkl", "wb") as f:
         pickle.dump(user_state, f)
-    with open("users.pkl", "wb") as f:
-        pickle.dump(users_set, f)
 
 if __name__ == "__main__":
     main()
-
-
-
