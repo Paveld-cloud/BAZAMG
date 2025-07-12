@@ -1,7 +1,9 @@
 import logging
-import pandas as pd
 import os
 import pickle
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,10 +18,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Токен из переменных окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7574993294:AAGcnWNkh_A10JSaxDi0m4KjSKtSQgIdPuk")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Читаем таблицу и нормализуем названия столбцов
-df = pd.read_excel("data.xlsx")
+# Google Sheets настройки
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
+SHEET_NAME = "Лист1"
+
+def load_data():
+    creds_info = json.loads(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
+    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(SPREADSHEET_URL).worksheet(SHEET_NAME)
+    records = sheet.get_all_records()
+    return records
+
+# Загружаем данные из Google Sheets
+raw_data = load_data()
+
+# Преобразуем в DataFrame-подобную структуру (список словарей)
+from pandas import DataFrame
+
+df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 
 # Храним состояние (последний запрос, смещение) по user_id
@@ -31,13 +51,11 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
-# /start — очищаем историю и приветствуем
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
-# /more — продолжение выдачи результатов
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id)
@@ -49,14 +67,13 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = results.iloc[offset: offset + 5]
     for _, row in page.iterrows():
         text = (
-            f"🔹 Тип: {row['тип']}\n"
-            f"📦 Наименование: {row['наименование']}\n"
-            f"🔢 Код: {row['код']}\n"
-            f"📦 Кол-во: {row['количество']}\n"
-            f"💰 Цена: {row['цена']} {row['валюта']}\n"
-            f"🏭 Изготовитель: {row['изготовитель']}\n"
-            f"⚙ OEM: {row['oem']}"
-        )
+            f"\U0001F539 Тип: {row['тип']}\n"
+            f"\U0001F4E6 Наименование: {row['наименование']}\n"
+            f"\U0001F522 Код: {row['код']}\n"
+            f"\U0001F4E6 Кол-во: {row['количество']}\n"
+            f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
+            f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
+            f"\u2699 OEM: {row['oem']}")
         await update.message.reply_text(text)
 
     new_offset = offset + 5
@@ -66,42 +83,38 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Больше результатов нет.")
 
-# /help — справка
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 Доступные команды:\n"
+        "\U0001F4D6 Доступные команды:\n"
         "/start — начать заново\n"
         "/more — показать ещё результаты\n"
         "/help — справка\n"
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
-# /stats — показать статистику поиска
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+    await update.message.reply_text(f"\U0001F50D Вы сделали {count} поисков за сессию.")
 
-# /export — экспорт текущих результатов в Excel
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import pandas as pd
     user_id = update.effective_user.id
     state = user_state.get(user_id)
     if not state:
         await update.message.reply_text("Сначала выполните поиск.")
         return
-    
+
     filename = f"export_{user_id}.xlsx"
     state["results"].to_excel(filename, index=False)
     with open(filename, "rb") as f:
         await update.message.reply_document(InputFile(f, filename))
     os.remove(filename)
 
-# Обработка поиска
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
 
-    # Расширенный фильтр
     mask = (
         df['тип'].str.lower().str.contains(query, na=False) |
         df['наименование'].str.lower().str.contains(query, na=False) |
@@ -126,26 +139,23 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for _, row in results.head(5).iterrows():
         text = (
-            f"🔹 Тип: {row['тип']}\n"
-            f"📦 Наименование: {row['наименование']}\n"
-            f"🔢 Код: {row['код']}\n"
-            f"📦 Кол-во: {row['количество']}\n"
-            f"💰 Цена: {row['цена']} {row['валюта']}\n"
-            f"🏭 Изготовитель: {row['изготовитель']}\n"
-            f"⚙ OEM: {row['oem']}"
-        )
+            f"\U0001F539 Тип: {row['тип']}\n"
+            f"\U0001F4E6 Наименование: {row['наименование']}\n"
+            f"\U0001F522 Код: {row['код']}\n"
+            f"\U0001F4E6 Кол-во: {row['количество']}\n"
+            f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
+            f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
+            f"\u2699 OEM: {row['oem']}")
         await update.message.reply_text(text)
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
 
-# Глобальный обработчик ошибок
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Ошибка в Telegram обработчике", exc_info=context.error)
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
-# Главная функция
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -158,7 +168,6 @@ def main():
     logger.info("Бот запущен")
     app.run_polling()
 
-    # Сохраняем состояние при завершении
     with open("state.pkl", "wb") as f:
         pickle.dump(user_state, f)
 
