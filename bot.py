@@ -39,6 +39,7 @@ def load_data():
 raw_data = load_data()
 
 from pandas import DataFrame
+
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
@@ -63,8 +64,8 @@ def generate_inline_keyboard(code: str):
         ]
     ])
 
-def normalize(text):
-    return re.sub(r"[\s_]+", "", str(text).lower())
+def normalize(text: str) -> str:
+    return re.sub(r'[\W_]+', '', text.lower())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -131,19 +132,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    query = normalize(update.message.text)
+    query = update.message.text.strip().lower()
+    norm_query = normalize(query)
 
-    mask = (
-        df["тип"].apply(normalize).str.contains(query, na=False) |
-        df["наименование"].apply(normalize).str.contains(query, na=False) |
-        df["код"].apply(normalize).str.contains(query, na=False) |
-        df["oem"].astype(str).apply(normalize).str.contains(query, na=False) |
-        df["изготовитель"].apply(normalize).str.contains(query, na=False)
+    mask = df.apply(
+        lambda row: any(norm_query in normalize(str(value)) for value in [
+            row.get("тип", ""), row.get("наименование", ""), row.get("код", ""),
+            row.get("oem", ""), row.get("изготовитель", "")
+        ]),
+        axis=1
     )
+
     results = df[mask]
 
     if results.empty:
-        await update.message.reply_text(f'По запросу "{update.message.text}" ничего не найдено.')
+        await update.message.reply_text(f'По запросу "{query}" ничего не найдено.')
         return
 
     search_count[user_id] = search_count.get(user_id, 0) + 1
@@ -195,5 +198,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
