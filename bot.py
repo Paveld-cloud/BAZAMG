@@ -52,15 +52,15 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
-def generate_inline_keyboard(item_name: str):
+def generate_inline_keyboard(code: str):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("\U0001F4D6 История", callback_data=f"history|{item_name}"),
-            InlineKeyboardButton("\U0001F9FC Уход", callback_data=f"care|{item_name}"),
+            InlineKeyboardButton("\U0001F4D6 История", callback_data=f"history|{code}"),
+            InlineKeyboardButton("\U0001F9FC Уход", callback_data=f"care|{code}"),
         ],
         [
-            InlineKeyboardButton("\U0001F4DD Описание", callback_data=f"description|{item_name}"),
-            InlineKeyboardButton("\U0001F3A5 Видео", callback_data=f"video|{item_name}"),
+            InlineKeyboardButton("\U0001F4DD Описание", callback_data=f"description|{code}"),
+            InlineKeyboardButton("\U0001F3A5 Видео", callback_data=f"video|{code}"),
         ]
     ])
 
@@ -87,7 +87,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
             f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
             f"\u2699 OEM: {row['oem']}")
-        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(row['наименование']))
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row['код'])))
 
     new_offset = offset + 5
     user_state[user_id]["offset"] = new_offset
@@ -159,7 +159,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
             f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
             f"\u2699 OEM: {row['oem']}")
-        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(row['наименование']))
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row['код'])))
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
@@ -168,16 +168,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    action, item_name = query.data.split("|", 1)
+    action, item_code = query.data.split("|", 1)
 
     if action == "history":
-        await query.message.reply_text(f"\U0001F4D6 История детали: {item_name}")
+        await query.message.reply_text(f"\U0001F4D6 История детали: {item_code}")
     elif action == "care":
-        await query.message.reply_text(f"\U0001F9FC Уход за деталью: {item_name}")
+        await query.message.reply_text(f"\U0001F9FC Уход за деталью: {item_code}")
     elif action == "description":
-        await query.message.reply_text(f"\U0001F4DD Описание детали: {item_name}")
+        await query.message.reply_text(f"\U0001F4DD Описание детали: {item_code}")
     elif action == "video":
-        await query.message.reply_text(f"\U0001F3A5 Видеообзор: {item_name}")
+        await query.message.reply_text(f"\U0001F3A5 Видеообзор: {item_code}")
     else:
         await query.message.reply_text("Неизвестное действие.")
 
