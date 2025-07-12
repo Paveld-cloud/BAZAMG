@@ -4,11 +4,12 @@ import pickle
 import json
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -23,7 +24,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 # Google Sheets настройки
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-SHEET_NAME = "SAP"
+SHEET_NAME = "SAP DATA"
 
 def load_data():
     creds_info = json.loads(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
@@ -51,6 +52,18 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
+def generate_inline_keyboard(item_name: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001F4D6 История", callback_data=f"history|{item_name}"),
+            InlineKeyboardButton("\U0001F9FC Уход", callback_data=f"care|{item_name}"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4DD Описание", callback_data=f"description|{item_name}"),
+            InlineKeyboardButton("\U0001F3A5 Видео", callback_data=f"video|{item_name}"),
+        ]
+    ])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
@@ -74,7 +87,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
             f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
             f"\u2699 OEM: {row['oem']}")
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(row['наименование']))
 
     new_offset = offset + 5
     user_state[user_id]["offset"] = new_offset
@@ -146,10 +159,27 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001F4B0 Цена: {row['цена']} {row['валюта']}\n"
             f"\U0001F3ED Изготовитель: {row['изготовитель']}\n"
             f"\u2699 OEM: {row['oem']}")
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(row['наименование']))
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, item_name = query.data.split("|", 1)
+
+    if action == "history":
+        await query.message.reply_text(f"\U0001F4D6 История детали: {item_name}")
+    elif action == "care":
+        await query.message.reply_text(f"\U0001F9FC Уход за деталью: {item_name}")
+    elif action == "description":
+        await query.message.reply_text(f"\U0001F4DD Описание детали: {item_name}")
+    elif action == "video":
+        await query.message.reply_text(f"\U0001F3A5 Видеообзор: {item_name}")
+    else:
+        await query.message.reply_text("Неизвестное действие.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Ошибка в Telegram обработчике", exc_info=context.error)
@@ -163,6 +193,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
