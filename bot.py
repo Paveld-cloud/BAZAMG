@@ -42,6 +42,7 @@ from pandas import DataFrame
 
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
+df['код'] = df['код'].astype(str).str.strip().str.lower()
 
 # Храним состояние (последний запрос, смещение) по user_id
 user_state = {}
@@ -131,7 +132,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mask = (
         df['тип'].str.lower().str.contains(query, na=False) |
         df['наименование'].str.lower().str.contains(query, na=False) |
-        df['код'].astype(str).str.lower().str.contains(query, na=False) |
+        df['код'].str.contains(query, na=False) |
         df['oem'].astype(str).str.lower().str.contains(query, na=False) |
         df['изготовитель'].str.lower().str.contains(query, na=False)
     )
@@ -204,3 +205,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
