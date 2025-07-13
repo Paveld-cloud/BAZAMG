@@ -5,11 +5,12 @@ import json
 import gspread
 import re
 from google.oauth2.service_account import Credentials
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -51,6 +52,13 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
+def generate_inline_keyboard(code: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Описание", callback_data=f"description|{code}"),
+        ]
+    ])
+
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
 
@@ -80,7 +88,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = results.iloc[offset: offset + 5]
     for _, row in page.iterrows():
         text = format_row(row)
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
     offset += 5
     user_state[user_id]["offset"] = offset
     if offset < len(results):
@@ -145,10 +153,19 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for _, row in results.head(5).iterrows():
         text = format_row(row)
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action, item_code = query.data.split("|", 1)
+    if action == "description":
+        await query.message.reply_text(f"📝 Описание детали: {item_code}")
+    else:
+        await query.message.reply_text("Неизвестное действие.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка", exc_info=context.error)
@@ -162,6 +179,7 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
