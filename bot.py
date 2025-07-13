@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Админы
-ADMINS = {225177765}
+ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
 
 # Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -54,6 +54,13 @@ if os.path.exists("state.pkl"):
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
 
+def find_image_url_by_code(code: str, df) -> str:
+    code = code.lower().strip()
+    for url in df["image"].dropna():
+        if code in url.lower():
+            return url
+    return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
@@ -61,7 +68,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📘 Команды:\n"
+        "\ud83d\udcd8 Команды:\n"
         "/start — сброс поиска\n"
         "/more — показать ещё\n"
         "/help — справка\n"
@@ -90,22 +97,18 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def format_row(row):
     return (
-        f"🔹 Тип: {row['тип']}\n"
-        f"📦 Наименование: {row['наименование']}\n"
-        f"🔢 Код: {row['код']}\n"
-        f"📦 Кол-во: {row['количество']}\n"
-        f"💰 Цена: {row['цена']} {row['валюта']}\n"
-        f"🏭 Изготовитель: {row['изготовитель']}\n"
-        f"⚙️ OEM: {row['oem']}"
+        f"\ud83d\udd39 Тип: {row['тип']}\n"
+        f"\ud83d\udce6 Наименование: {row['наименование']}\n"
+        f"\ud83d\udcc2 Код: {row['код']}\n"
+        f"\ud83d\udce6 Кол-во: {row['количество']}\n"
+        f"\ud83d\udcb0 Цена: {row['цена']} {row['валюта']}\n"
+        f"\ud83c\udfe0 Изготовитель: {row['изготовитель']}\n"
+        f"\u2699\ufe0f OEM: {row['oem']}"
     )
 
 async def send_row_with_image(update: Update, row, text: str):
-    code = str(row.get("код", "")).strip().lower()
-    image_url = ""
-    for img in df["image"].dropna():
-        if code in img:
-            image_url = img.strip()
-            break
+    code = str(row["код"]).strip().lower()
+    image_url = find_image_url_by_code(code, df)
     if image_url:
         try:
             await update.message.reply_photo(photo=image_url, caption=text[:1024])
@@ -131,7 +134,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+    await update.message.reply_text(f"\ud83d\udd0d Вы сделали {count} поисков за сессию.")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
