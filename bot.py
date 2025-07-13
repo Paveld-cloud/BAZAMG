@@ -10,22 +10,25 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
-from pandas import DataFrame
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Админы
+# Админы и доступ
 ADMINS = {225177765}
+ACCESS_CONTROL = {
+    225177765: {"name": "Павел"},
+}
 
 # Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 SHEET_NAME = "SAP"
 
 # Загрузка данных из Google Sheets
@@ -37,6 +40,9 @@ def load_data():
     return sheet.get_all_records()
 
 raw_data = load_data()
+
+from pandas import DataFrame
+
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
@@ -52,15 +58,11 @@ if os.path.exists("state.pkl"):
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
 
-def find_image_url_by_code(code: str) -> str:
-    code = code.lower()
-    for url in df.get("image", []).dropna():
-        if code in str(url).lower():
-            return url.strip()
-    return ""
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id not in ACCESS_CONTROL:
+        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+        return
     user_state.pop(user_id, None)
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
@@ -72,51 +74,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — справка\n"
         "/export — экспорт результатов\n"
         "/stats — сколько раз искали\n"
+        "/access — управление доступом (только для админов)\n"
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
-def format_row(row):
-    return (
-        f"🔹 Тип: {row['тип']}\n"
-        f"📦 Наименование: {row['наименование']}\n"
-        f"🔢 Код: {row['код']}\n"
-        f"📦 Кол-во: {row['количество']}\n"
-        f"💰 Цена: {row['цена']} {row['валюта']}\n"
-        f"🏭 Изготовитель: {row['изготовитель']}\n"
-        f"⚙️ OEM: {row['oem']}"
-    )
-
-async def send_row_with_image(update: Update, row, text: str):
-    image_url = find_image_url_by_code(row["код"])
-    if image_url:
-        try:
-            await update.message.reply_photo(photo=image_url, caption=text[:1024])
-        except Exception as e:
-            logger.warning(f"Ошибка при отправке фото: {e}")
-            await update.message.reply_text(text)
-    else:
-        await update.message.reply_text(text)
-
-async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from pandas import ExcelWriter
+async def access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    state = user_state.get(user_id)
-    if not state:
-        await update.message.reply_text("Сначала выполните поиск.")
+    if user_id not in ADMINS:
+        await update.message.reply_text("⛔ У вас нет прав на управление доступом.")
         return
-    filename = f"export_{user_id}.xlsx"
-    state["results"].to_excel(filename, index=False)
-    with open(filename, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename))
-    os.remove(filename)
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используй:\n/add_user ID\n/remove_user ID\n/list_users")
+        return
+
+    command = args[0]
+    if command == "add_user" and len(args) > 1:
+        try:
+            new_user_id = int(args[1])
+            ACCESS_CONTROL[new_user_id] = {"name": f"user_{new_user_id}"}
+            await update.message.reply_text(f"✅ Пользователь {new_user_id} добавлен.")
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.")
+    elif command == "remove_user" and len(args) > 1:
+        try:
+            del ACCESS_CONTROL[int(args[1])]
+            await update.message.reply_text("❌ Пользователь удалён.")
+        except:
+            await update.message.reply_text("❌ Пользователь не найден.")
+    elif command == "list_users":
+        users = "\n".join([f"{uid} — {data['name']}" for uid, data in ACCESS_CONTROL.items()])
+        await update.message.reply_text(f"👥 Разрешённые пользователи:\n{users}")
+    else:
+        await update.message.reply_text("❌ Неизвестная команда.")
 
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id not in ACCESS_CONTROL:
+        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+        return
     state = user_state.get(user_id)
     if not state:
         await update.message.reply_text("Сначала выполните поиск.")
@@ -133,8 +130,57 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Больше результатов нет.")
 
+def format_row(row):
+    return (
+        f"🔹 Тип: {row['тип']}\n"
+        f"📦 Наименование: {row['наименование']}\n"
+        f"🔢 Код: {row['код']}\n"
+        f"📦 Кол-во: {row['количество']}\n"
+        f"💰 Цена: {row['цена']} {row['валюта']}\n"
+        f"🏭 Изготовитель: {row['изготовитель']}\n"
+        f"⚙️ OEM: {row['oem']}"
+    )
+
+async def send_row_with_image(update: Update, row, text: str):
+    image_url = row.get("image", "").strip()
+    if image_url:
+        try:
+            await update.message.reply_photo(photo=image_url, caption=text[:1024])
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке фото: {e}")
+            await update.message.reply_text(text)
+    else:
+        await update.message.reply_text(text)
+
+async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ACCESS_CONTROL:
+        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+        return
+    from pandas import ExcelWriter
+    state = user_state.get(user_id)
+    if not state:
+        await update.message.reply_text("Сначала выполните поиск.")
+        return
+    filename = f"export_{user_id}.xlsx"
+    state["results"].to_excel(filename, index=False)
+    with open(filename, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename))
+    os.remove(filename)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ACCESS_CONTROL:
+        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+        return
+    count = search_count.get(user_id, 0)
+    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id not in ACCESS_CONTROL:
+        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+        return
     query = update.message.text.strip().lower()
     norm_query = normalize(query)
 
@@ -178,6 +224,7 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("access", access))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
