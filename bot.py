@@ -13,18 +13,19 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from pandas import DataFrame
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Админы
-ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
+ADMINS = {225177765}
 
 # Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SHEET_NAME = "SAP"
 
 # Загрузка данных из Google Sheets
@@ -36,9 +37,6 @@ def load_data():
     return sheet.get_all_records()
 
 raw_data = load_data()
-
-from pandas import DataFrame
-
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
@@ -53,6 +51,13 @@ if os.path.exists("state.pkl"):
 
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
+
+def find_image_url_by_code(code: str) -> str:
+    code = code.lower()
+    for url in df.get("image", []).dropna():
+        if code in str(url).lower():
+            return url.strip()
+    return ""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -70,24 +75,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
-async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = user_state.get(user_id)
-    if not state:
-        await update.message.reply_text("Сначала выполните поиск.")
-        return
-    query, offset, results = state["query"], state["offset"], state["results"]
-    page = results.iloc[offset: offset + 5]
-    for _, row in page.iterrows():
-        text = format_row(row)
-        await send_row_with_image(update, row, text)
-    offset += 5
-    user_state[user_id]["offset"] = offset
-    if offset < len(results):
-        await update.message.reply_text("Напишите /more для следующих результатов.")
-    else:
-        await update.message.reply_text("Больше результатов нет.")
-
 def format_row(row):
     return (
         f"🔹 Тип: {row['тип']}\n"
@@ -100,14 +87,7 @@ def format_row(row):
     )
 
 async def send_row_with_image(update: Update, row, text: str):
-    code_value = str(row.get("код", "")).strip().upper()
-    image_url = ""
-    
-    for possible_url in df.get("image", []):
-        if isinstance(possible_url, str) and code_value in possible_url:
-            image_url = possible_url.strip()
-            break
-
+    image_url = find_image_url_by_code(row["код"])
     if image_url:
         try:
             await update.message.reply_photo(photo=image_url, caption=text[:1024])
@@ -134,6 +114,24 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
     await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
+
+async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+    if not state:
+        await update.message.reply_text("Сначала выполните поиск.")
+        return
+    query, offset, results = state["query"], state["offset"], state["results"]
+    page = results.iloc[offset: offset + 5]
+    for _, row in page.iterrows():
+        text = format_row(row)
+        await send_row_with_image(update, row, text)
+    offset += 5
+    user_state[user_id]["offset"] = offset
+    if offset < len(results):
+        await update.message.reply_text("Напишите /more для следующих результатов.")
+    else:
+        await update.message.reply_text("Больше результатов нет.")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
