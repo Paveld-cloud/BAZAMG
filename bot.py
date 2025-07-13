@@ -10,7 +10,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -101,7 +100,14 @@ def format_row(row):
     )
 
 async def send_row_with_image(update: Update, row, text: str):
-    image_url = row.get("image", "").strip()
+    code_value = str(row.get("код", "")).strip().upper()
+    image_url = ""
+    
+    for possible_url in df.get("image", []):
+        if isinstance(possible_url, str) and code_value in possible_url:
+            image_url = possible_url.strip()
+            break
+
     if image_url:
         try:
             await update.message.reply_photo(photo=image_url, caption=text[:1024])
