@@ -13,19 +13,21 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from pandas import DataFrame
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Настройки
+# Админы
+ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
+
+# Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 SHEET_NAME = "SAP"
 
-# Загрузка данных
+# Загрузка данных из Google Sheets
 def load_data():
     creds_info = json.loads(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -34,12 +36,14 @@ def load_data():
     return sheet.get_all_records()
 
 raw_data = load_data()
+
+from pandas import DataFrame
+
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
-df["image"] = df["image"].astype(str).str.strip() if "image" in df.columns else ""
 
-# Состояние
+# Состояние пользователя
 user_state = {}
 search_count = {}
 
@@ -48,54 +52,29 @@ if os.path.exists("state.pkl"):
         user_state = pickle.load(f)
 
 def normalize(text: str) -> str:
-    return re.sub(r'[\W_]+', '', text.lower())
+    return re.sub(r'[^a-zA-Z0-9]+', '', text.lower())
 
-# 🔍 Поиск фото по совпадению кода в ссылке
 def find_image_url_by_code(code: str) -> str:
-    code = code.lower()
+    code_norm = normalize(code)
     for url in df["image"]:
-        if code in url.lower():
+        if code_norm in normalize(str(url)):
             return url
     return ""
 
-def format_row(row):
-    return (
-        f"🔹 Тип: {row.get('тип', '')}\n"
-        f"📦 Наименование: {row.get('наименование', '')}\n"
-        f"🔢 Код: {row.get('код', '')}\n"
-        f"📦 Кол-во: {row.get('количество', '')}\n"
-        f"💰 Цена: {row.get('цена', '')} {row.get('валюта', '')}\n"
-        f"🏭 Изготовитель: {row.get('изготовитель', '')}\n"
-        f"⚙️ OEM: {row.get('oem', '')}"
-    )
-
-# Фото + текст
-async def send_row_with_image(update: Update, row, text: str):
-    code = row.get("код", "").strip().lower()
-    image_url = find_image_url_by_code(code)
-    try:
-        if image_url:
-            await update.message.reply_photo(photo=image_url, caption=text[:1024])
-        else:
-            await update.message.reply_text(text)
-    except Exception as e:
-        logger.error(f"[Ошибка при отправке фото] {e}")
-        await update.message.reply_text(text)
-
-# Команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
-    await update.message.reply_text("Привет! Напиши ключевое слово, и я найду нужную деталь.")
+    await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📘 Команды:\n"
+        "\U0001F4D8 Команды:\n"
         "/start — сброс поиска\n"
         "/more — показать ещё\n"
         "/help — справка\n"
-        "/export — экспорт\n"
-        "/stats — статистика"
+        "/export — экспорт результатов\n"
+        "/stats — сколько раз искали\n"
+        "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,11 +91,35 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     offset += 5
     user_state[user_id]["offset"] = offset
     if offset < len(results):
-        await update.message.reply_text("Напишите /more для следующих.")
+        await update.message.reply_text("Напишите /more для следующих результатов.")
     else:
-        await update.message.reply_text("Это все результаты.")
+        await update.message.reply_text("Больше результатов нет.")
+
+def format_row(row):
+    return (
+        f"🔹 Тип: {row['тип']}\n"
+        f"📦 Наименование: {row['наименование']}\n"
+        f"🔢 Код: {row['код']}\n"
+        f"📦 Кол-во: {row['количество']}\n"
+        f"💰 Цена: {row['цена']} {row['валюта']}\n"
+        f"🏭 Изготовитель: {row['изготовитель']}\n"
+        f"⚙️ OEM: {row['oem']}"
+    )
+
+async def send_row_with_image(update: Update, row, text: str):
+    code = str(row.get("код", ""))
+    image_url = find_image_url_by_code(code)
+    if image_url:
+        try:
+            await update.message.reply_photo(photo=image_url, caption=text[:1024])
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке фото: {e}")
+            await update.message.reply_text(text)
+    else:
+        await update.message.reply_text(text)
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from pandas import ExcelWriter
     user_id = update.effective_user.id
     state = user_state.get(user_id)
     if not state:
@@ -131,9 +134,8 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"🔍 Поисков за сессию: {count}")
+    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
 
-# Поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
@@ -146,6 +148,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]),
         axis=1
     )
+
     results = df[mask]
 
     if results.empty:
@@ -153,22 +156,24 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     search_count[user_id] = search_count.get(user_id, 0) + 1
-    user_state[user_id] = {"query": query, "offset": 5, "results": results}
+    user_state[user_id] = {
+        "query": query,
+        "offset": 5,
+        "results": results
+    }
 
     for _, row in results.head(5).iterrows():
         text = format_row(row)
         await send_row_with_image(update, row, text)
 
     if len(results) > 5:
-        await update.message.reply_text("Показаны первые 5. Напишите /more для продолжения.")
+        await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
 
-# Глобальная ошибка
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Произошла ошибка:", exc_info=context.error)
+    logger.error("Ошибка", exc_info=context.error)
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text("❌ Внутренняя ошибка. Попробуйте снова позже.")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
-# Запуск
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -180,6 +185,7 @@ def main():
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
     app.run_polling()
+
     with open("state.pkl", "wb") as f:
         pickle.dump(user_state, f)
 
