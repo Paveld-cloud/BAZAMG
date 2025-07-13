@@ -10,7 +10,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -19,11 +18,16 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Админы и доступ
-ADMINS = {225177765}
-ACCESS_CONTROL = {
-    225177765: {"name": "Павел"},
-}
+# Админы
+ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
+
+# Список разрешённых пользователей (загружается/сохраняется)
+ALLOWED_USERS_FILE = "allowed_users.pkl"
+if os.path.exists(ALLOWED_USERS_FILE):
+    with open(ALLOWED_USERS_FILE, "rb") as f:
+        allowed_users = pickle.load(f)
+else:
+    allowed_users = set()
 
 # Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -58,15 +62,21 @@ if os.path.exists("state.pkl"):
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
 
+def is_allowed(user_id: int) -> bool:
+    return user_id in ADMINS or user_id in allowed_users
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ACCESS_CONTROL:
-        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
         return
     user_state.pop(user_id, None)
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
+        return
     await update.message.reply_text(
         "📘 Команды:\n"
         "/start — сброс поиска\n"
@@ -74,45 +84,41 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — справка\n"
         "/export — экспорт результатов\n"
         "/stats — сколько раз искали\n"
-        "/access — управление доступом (только для админов)\n"
+        "/add_user <id> — добавить пользователя\n"
+        "/list_users — список пользователей\n"
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
-async def access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        await update.message.reply_text("⛔ У вас нет прав на управление доступом.")
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMINS:
+        await update.message.reply_text("⛔️ Только админ может добавлять пользователей.")
         return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Используй:\n/add_user ID\n/remove_user ID\n/list_users")
+    if not context.args:
+        await update.message.reply_text("Укажите user_id: /add_user 123456789")
         return
+    try:
+        user_id = int(context.args[0])
+        allowed_users.add(user_id)
+        with open(ALLOWED_USERS_FILE, "wb") as f:
+            pickle.dump(allowed_users, f)
+        await update.message.reply_text(f"✅ Пользователь {user_id} добавлен.")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат user_id.")
 
-    command = args[0]
-    if command == "add_user" and len(args) > 1:
-        try:
-            new_user_id = int(args[1])
-            ACCESS_CONTROL[new_user_id] = {"name": f"user_{new_user_id}"}
-            await update.message.reply_text(f"✅ Пользователь {new_user_id} добавлен.")
-        except ValueError:
-            await update.message.reply_text("❌ ID должен быть числом.")
-    elif command == "remove_user" and len(args) > 1:
-        try:
-            del ACCESS_CONTROL[int(args[1])]
-            await update.message.reply_text("❌ Пользователь удалён.")
-        except:
-            await update.message.reply_text("❌ Пользователь не найден.")
-    elif command == "list_users":
-        users = "\n".join([f"{uid} — {data['name']}" for uid, data in ACCESS_CONTROL.items()])
-        await update.message.reply_text(f"👥 Разрешённые пользователи:\n{users}")
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMINS:
+        await update.message.reply_text("⛔️ Только админ может просматривать список пользователей.")
+        return
+    if not allowed_users:
+        await update.message.reply_text("Нет добавленных пользователей.")
     else:
-        await update.message.reply_text("❌ Неизвестная команда.")
+        users = "\n".join(str(uid) for uid in allowed_users)
+        await update.message.reply_text(f"👥 Разрешённые пользователи:\n{users}")
 
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ACCESS_CONTROL:
-        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
         return
     state = user_state.get(user_id)
     if not state:
@@ -142,20 +148,17 @@ def format_row(row):
     )
 
 async def send_row_with_image(update: Update, row, text: str):
-    image_url = row.get("image", "").strip()
-    if image_url:
-        try:
-            await update.message.reply_photo(photo=image_url, caption=text[:1024])
-        except Exception as e:
-            logger.warning(f"Ошибка при отправке фото: {e}")
-            await update.message.reply_text(text)
-    else:
+    code = row.get("код", "").upper()
+    image_url = f"https://i.ibb.co/{code}.jpg"  # или другой шаблон, если известен
+    try:
+        await update.message.reply_photo(photo=image_url, caption=text[:1024])
+    except:
         await update.message.reply_text(text)
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ACCESS_CONTROL:
-        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
         return
     from pandas import ExcelWriter
     state = user_state.get(user_id)
@@ -170,16 +173,16 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ACCESS_CONTROL:
-        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
         return
     count = search_count.get(user_id, 0)
     await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ACCESS_CONTROL:
-        await update.message.reply_text("⛔ У вас нет доступа к боту.")
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔️ У вас нет доступа к боту.")
         return
     query = update.message.text.strip().lower()
     norm_query = normalize(query)
@@ -224,7 +227,8 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("access", access))
+    app.add_handler(CommandHandler("add_user", add_user))
+    app.add_handler(CommandHandler("list_users", list_users))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
