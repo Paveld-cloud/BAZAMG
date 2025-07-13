@@ -5,7 +5,7 @@ import json
 import gspread
 import re
 from google.oauth2.service_account import Credentials
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -52,13 +52,6 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
-def generate_inline_keyboard(code: str):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 Описание", callback_data=f"description|{code}"),
-        ]
-    ])
-
 def normalize(text: str) -> str:
     return re.sub(r'[\W_]+', '', text.lower())
 
@@ -88,7 +81,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = results.iloc[offset: offset + 5]
     for _, row in page.iterrows():
         text = format_row(row)
-        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
+        await send_row_with_image(update, row, text)
     offset += 5
     user_state[user_id]["offset"] = offset
     if offset < len(results):
@@ -106,6 +99,17 @@ def format_row(row):
         f"🏭 Изготовитель: {row['изготовитель']}\n"
         f"⚙️ OEM: {row['oem']}"
     )
+
+async def send_row_with_image(update: Update, row, text: str):
+    image_url = row.get("image", "").strip()
+    if image_url:
+        try:
+            await update.message.reply_photo(photo=image_url, caption=text[:1024])
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке фото: {e}")
+            await update.message.reply_text(text)
+    else:
+        await update.message.reply_text(text)
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from pandas import ExcelWriter
@@ -153,19 +157,10 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for _, row in results.head(5).iterrows():
         text = format_row(row)
-        await update.message.reply_text(text, reply_markup=generate_inline_keyboard(str(row["код"])))
+        await send_row_with_image(update, row, text)
 
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action, item_code = query.data.split("|", 1)
-    if action == "description":
-        await query.message.reply_text(f"📝 Описание детали: {item_code}")
-    else:
-        await query.message.reply_text("Неизвестное действие.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка", exc_info=context.error)
@@ -179,7 +174,6 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
