@@ -13,13 +13,14 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from pandas import DataFrame, ExcelWriter
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Админы
-ADMINS = {225177765}  # ← сюда добавьте свой Telegram user_id
+ADMINS = {225177765}
 
 # Токен и Google Sheets настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -35,10 +36,8 @@ def load_data():
     sheet = client.open_by_url(SPREADSHEET_URL).worksheet(SHEET_NAME)
     return sheet.get_all_records()
 
+# Инициализация данных
 raw_data = load_data()
-
-from pandas import DataFrame
-
 df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
@@ -51,9 +50,11 @@ if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
+# Нормализация запроса (оставляем кириллицу, латиницу, цифры и пробелы)
 def normalize(text: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9]+', '', text.lower())
+    return re.sub(r'[^\w\s]', '', text.lower()).strip()
 
+# Поиск изображения по коду
 def find_image_url_by_code(code: str) -> str:
     code_norm = normalize(code)
     for url in df["image"]:
@@ -61,11 +62,13 @@ def find_image_url_by_code(code: str) -> str:
             return url
     return ""
 
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
+# Команда /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\U0001F4D8 Команды:\n"
@@ -77,6 +80,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
+# Команда /more
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id)
@@ -95,6 +99,7 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Больше результатов нет.")
 
+# Форматирование строки ответа
 def format_row(row):
     return (
         f"🔹 Тип: {row['тип']}\n"
@@ -106,6 +111,7 @@ def format_row(row):
         f"⚙️ OEM: {row['oem']}"
     )
 
+# Отправка строки с изображением (если есть)
 async def send_row_with_image(update: Update, row, text: str):
     code = str(row.get("код", ""))
     image_url = find_image_url_by_code(code)
@@ -118,8 +124,8 @@ async def send_row_with_image(update: Update, row, text: str):
     else:
         await update.message.reply_text(text)
 
+# Команда /export
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from pandas import ExcelWriter
     user_id = update.effective_user.id
     state = user_state.get(user_id)
     if not state:
@@ -131,21 +137,31 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(f, filename))
     os.remove(filename)
 
+# Команда /stats
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
     await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
 
+# Поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     query = update.message.text.strip().lower()
     norm_query = normalize(query)
 
+    if not norm_query:
+        await update.message.reply_text("Введите более осмысленный запрос.")
+        return
+
+    def matches(value: str, query: str) -> bool:
+        return query in value
+
     mask = df.apply(
-        lambda row: any(norm_query in normalize(str(value)) for value in [
-            row.get("тип", ""), row.get("наименование", ""), row.get("код", ""),
-            row.get("oem", ""), row.get("изготовитель", "")
-        ]),
+        lambda row: any(
+            matches(normalize(str(value)), norm_query)
+            for value in [row.get("тип", ""), row.get("наименование", ""), row.get("код", ""),
+                          row.get("oem", ""), row.get("изготовитель", "")]
+        ),
         axis=1
     )
 
@@ -169,11 +185,13 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
 
+# Обработка ошибок
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка", exc_info=context.error)
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
+# Основной запуск
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
