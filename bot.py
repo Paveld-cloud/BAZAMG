@@ -36,7 +36,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}
-issue_state = {}  # Хранит: {user_id: {"part": ..., "quantity": ...}}
+issue_state = {}  # {user_id: {"part": ..., "quantity": ...}}
 search_count = {}
 
 # Админы
@@ -392,7 +392,7 @@ def main():
         entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
         states={
             ASK_QUANTITY: [
-                MessageHandler(filters.Regex(r"^\d+$"), handle_quantity)  # Только числа
+                MessageHandler(filters.Regex(r"^\d+$"), handle_quantity)
             ],
             ASK_COMMENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)
