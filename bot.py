@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # Этапы диалога списания
 ASK_QUANTITY, ASK_COMMENT = range(2)
 
+# Глобальные состояния
+user_state = {}          # Состояние поиска
+issue_state = {}         # Состояние списания ← БЫЛО ДОБАВЛЕНО!
+search_count = {}        # Счётчик поисков
+
 # Админы
 ADMINS = {225177765}
 
@@ -156,6 +161,7 @@ async def send_row_with_image(update: Update, row, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
+    search_count.pop(user_id, None)
     await update.message.reply_text("Привет! Отправь название, код или OEM детали.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -196,17 +202,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка добавления пользователя: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении пользователя.")
-
-# --- Состояние ---
-user_state = {}
-if os.path.exists("state.pkl"):
-    try:
-        with open("state.pkl", "rb") as f:
-            saved = pickle.load(f)
-            if isinstance(saved, dict):
-                user_state.update(saved)
-    except Exception as e:
-        logger.warning(f"Не удалось загрузить state.pkl: {e}")
 
 # --- Поиск ---
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,14 +252,22 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user_id = query.from_user.id
 
+    # Логируем, чтобы видеть, доходит ли колбэк
+    logger.info(f"Получен callback: {query.data} от user_id={user_id}")
+
     if user_id not in get_allowed_users():
         await query.answer("⛔ Доступ запрещён", show_alert=True)
         return ConversationHandler.END
 
     await query.answer()
-    code = query.data.split(":")[1]
 
-    part = df[df["код"] == code.lower()].to_dict(orient="records")
+    try:
+        code = query.data.split(":", 1)[1]  # Защита от длинного кода
+    except IndexError:
+        await query.message.reply_text("⚠ Ошибка: неверный код детали.")
+        return ConversationHandler.END
+
+    part = df[df["код"] == code.lower().strip()].to_dict(orient="records")
     if not part:
         await query.edit_message_text("❗ Деталь не найдена.")
         return ConversationHandler.END
@@ -334,7 +337,7 @@ def main():
     )
     app.add_handler(conv_handler)
 
-    # Поиск
+    # Поиск (важно: после ConversationHandler!)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
 
     # Ошибки
