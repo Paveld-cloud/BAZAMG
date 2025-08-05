@@ -300,15 +300,18 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     global issue_state
     query = update.callback_query
     user_id = query.from_user.id
+    logger.info(f"🟢 [Списание] handle_issue_button: user_id={user_id}")
 
     if user_id not in get_allowed_users():
         await query.answer("⛔ Доступ запрещён", show_alert=True)
         return ConversationHandler.END
 
     await query.answer()
+    logger.info("✅ Колбэк подтверждён")
 
     try:
         code = query.data.split(":", 1)[1]
+        logger.info(f"🔍 Ищем деталь с кодом: {code}")
     except IndexError:
         await query.message.reply_text("⚠ Ошибка: неверный код детали.")
         return ConversationHandler.END
@@ -319,10 +322,13 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     part = df[df["код"] == code.lower().strip()].to_dict(orient="records")
     if not part:
+        logger.warning(f"❌ Деталь с кодом {code} не найдена")
         await query.edit_message_text("❗ Деталь не найдена.")
         return ConversationHandler.END
 
     issue_state[user_id] = {"part": part[0]}
+    logger.info(f"✅ Деталь сохранена в issue_state: {part[0]['код']}")
+
     await query.message.reply_text("🔢 Введите количество:")
     return ASK_QUANTITY
 
@@ -330,8 +336,12 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global issue_state
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    logger.info(f"🟡 [Списание] handle_quantity вызван. user_id={user_id}, ввод='{text}'")
 
-    logger.info(f"📝 handle_quantity: user_id={user_id}, ввод='{text}'")
+    if user_id not in issue_state:
+        logger.error(f"❌ user_id={user_id} НЕ в issue_state! Диалог потерян.")
+        await update.message.reply_text("⚠ Ошибка: сессия списания утеряна. Начните заново.")
+        return ConversationHandler.END
 
     if not text.isdigit() or int(text) <= 0:
         await update.message.reply_text("Введите положительное число.")
@@ -348,12 +358,13 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     comment = update.message.text.strip()
-
-    logger.info(f"📝 handle_comment: комментарий='{comment}'")
+    logger.info(f"🟢 [Списание] handle_comment вызван. user_id={user_id}, коммент='{comment}'")
 
     data = issue_state.pop(user_id, {})
     part = data.get("part")
     quantity = data.get("quantity")
+
+    logger.info(f"📊 Попытка списания: part={bool(part)}, quantity={quantity}")
 
     if part and quantity:
         await save_issue_to_sheet(context, user, part, quantity, comment)
