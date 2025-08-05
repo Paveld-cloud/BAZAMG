@@ -5,6 +5,7 @@ import json
 import gspread
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo  # Для правильного часового пояса (Python 3.9+)
 from google.oauth2.service_account import Credentials
 from telegram import (
     Update,
@@ -34,7 +35,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}          # Состояние поиска
-issue_state = {}         # Состояние списания ← БЫЛО ДОБАВЛЕНО!
+issue_state = {}         # Состояние списания (была ошибка — теперь исправлена)
 search_count = {}        # Счётчик поисков
 
 # Админы
@@ -43,7 +44,7 @@ ADMINS = {225177765}
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # Без пробелов!
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # Без пробелов
 
 if not TELEGRAM_TOKEN or not SPREADSHEET_URL:
     raise EnvironmentError("Отсутствуют TELEGRAM_TOKEN или SPREADSHEET_URL в переменных окружения")
@@ -85,8 +86,11 @@ def load_data():
 # Асинхронное сохранение списания
 async def save_issue_to_sheet(context: ContextTypes.DEFAULT_TYPE, user, part, quantity, comment):
     try:
+        # 🔹 Указываем часовой пояс Ташкента (UTC+5)
+        tz = ZoneInfo("Asia/Tashkent")
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
         sheet = get_gsheet().worksheet("История")
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([
             now,
             user.id,
@@ -252,7 +256,6 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user_id = query.from_user.id
 
-    # Логируем, чтобы видеть, доходит ли колбэк
     logger.info(f"Получен callback: {query.data} от user_id={user_id}")
 
     if user_id not in get_allowed_users():
@@ -262,7 +265,7 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     try:
-        code = query.data.split(":", 1)[1]  # Защита от длинного кода
+        code = query.data.split(":", 1)[1]
     except IndexError:
         await query.message.reply_text("⚠ Ошибка: неверный код детали.")
         return ConversationHandler.END
