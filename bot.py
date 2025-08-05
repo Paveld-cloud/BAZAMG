@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ASK_QUANTITY, ASK_COMMENT = range(2)
 issue_state = {}
 
-# Админы и разрешённые пользователи
+# Админы
 ADMINS = {225177765}
 
 # Переменные окружения
@@ -45,6 +45,11 @@ def get_gsheet():
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_url(SPREADSHEET_URL)
+
+# Загрузка разрешённых пользователей
+def load_allowed_users():
+    sheet = get_gsheet().worksheet("Пользователи")
+    return [int(row[0]) for row in sheet.get_all_values() if row and row[0].isdigit()]
 
 # Загрузка данных
 def load_data():
@@ -143,6 +148,10 @@ async def send_row_with_image(update: Update, row, text: str):
 # Поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id not in load_allowed_users():
+        await update.message.reply_text("⛔ У вас нет доступа к этому боту.")
+        return
+
     query = update.message.text.strip().lower()
     norm_query = normalize(query)
 
@@ -184,10 +193,14 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Списание: кнопка → кол-во → комментарий
 async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.callback_query.from_user.id
+    if user_id not in load_allowed_users():
+        await update.callback_query.answer("⛔ У вас нет доступа", show_alert=True)
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
     code = query.data.split(":")[1]
-    user_id = query.from_user.id
 
     part = df[df["код"] == code].to_dict(orient="records")
     if not part:
@@ -236,7 +249,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Команда добавления пользователя
     app.add_handler(CommandHandler("adduser", add_user))
 
     conv_handler = ConversationHandler(
@@ -251,6 +263,7 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
+
     logger.info("Бот запущен")
     app.run_polling()
 
