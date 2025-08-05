@@ -5,7 +5,7 @@ import json
 import gspread
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Для правильного часового пояса (Python 3.9+)
+from zoneinfo import ZoneInfo  # Python 3.9+
 from google.oauth2.service_account import Credentials
 from telegram import (
     Update,
@@ -35,7 +35,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}          # Состояние поиска
-issue_state = {}         # Состояние списания (была ошибка — теперь исправлена)
+issue_state = {}         # Состояние списания
 search_count = {}        # Счётчик поисков
 
 # Админы
@@ -44,7 +44,7 @@ ADMINS = {225177765}
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # Без пробелов
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 if not TELEGRAM_TOKEN or not SPREADSHEET_URL:
     raise EnvironmentError("Отсутствуют TELEGRAM_TOKEN или SPREADSHEET_URL в переменных окружения")
@@ -63,7 +63,7 @@ _last_users_update = 0
 def get_allowed_users():
     global _allowed_users, _last_users_update
     now = datetime.now().timestamp()
-    if _allowed_users is None or now - _last_users_update > 300:  # Обновляем раз в 5 минут
+    if _allowed_users is None or now - _last_users_update > 300:
         try:
             sheet = get_gsheet().worksheet("Пользователи")
             rows = sheet.get_all_values()
@@ -86,7 +86,7 @@ def load_data():
 # Асинхронное сохранение списания
 async def save_issue_to_sheet(context: ContextTypes.DEFAULT_TYPE, user, part, quantity, comment):
     try:
-        # 🔹 Указываем часовой пояс Ташкента (UTC+5)
+        # 🔹 Время по Ташкенту
         tz = ZoneInfo("Asia/Tashkent")
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -115,17 +115,19 @@ df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
 
-# Оптимизация: маппинг код → image
-image_map = {}
-for _, row in df.iterrows():
-    code_norm = re.sub(r'[^\w\s]', '', str(row["код"]).lower().strip())
-    image_url = row.get("image")
-    if image_url and not (isinstance(image_url, float) and str(image_url).lower() == "nan"):
-        image_map[code_norm] = str(image_url)
-
+# --- 🔍 Поиск изображения: код содержится в URL (как в оригинальном коде) ---
 def find_image_url_by_code(code: str) -> str:
-    code_norm = re.sub(r'[^\w\s]', '', str(code).lower().strip())
-    return image_map.get(code_norm, "")
+    """
+    Ищет в столбце 'image' URL, содержащий код детали.
+    Пример: код 'uzcss06503' → найдёт URL, в котором встречается этот код.
+    """
+    code_norm = re.sub(r'[^\w\s]', '', code.lower().strip())
+    image_col = df["image"].astype(str)
+    for url in image_col[image_col != "nan"]:
+        url_norm = re.sub(r'[^\w\s]', '', url.lower().strip())
+        if code_norm in url_norm:
+            return url
+    return ""
 
 # Форматирование строки результата
 def format_row(row):
@@ -300,6 +302,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     part = data.get("part")
     quantity = data.get("quantity")
 
+    logger.info(f"Сохранение списания: код={part.get('код')}, кол-во={quantity}, коммент={comment}")
+
     if part and quantity:
         await save_issue_to_sheet(context, user, part, quantity, comment)
         await update.message.reply_text("✅ Списание выполнено.")
@@ -337,6 +341,7 @@ def main():
             ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True  # Защита от старых кнопок
     )
     app.add_handler(conv_handler)
 
