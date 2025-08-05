@@ -51,7 +51,7 @@ def load_data():
     sheet = get_gsheet().worksheet("SAP")
     return sheet.get_all_records()
 
-# Сохранение истории
+# Сохранение истории с типом
 def save_issue_to_sheet(user, part, quantity, comment):
     sheet = get_gsheet().worksheet("История")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -59,6 +59,7 @@ def save_issue_to_sheet(user, part, quantity, comment):
         now,
         user.id,
         user.full_name,
+        part.get("тип", ""),
         part.get("наименование", ""),
         part.get("код", ""),
         quantity,
@@ -117,58 +118,6 @@ async def send_row_with_image(update: Update, row, text: str):
             await update.message.reply_text(text, reply_markup=keyboard)
     else:
         await update.message.reply_text(text, reply_markup=keyboard)
-
-# Команды
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_state.pop(user_id, None)
-    await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "\U0001F4D8 Команды:\n"
-        "/start — сброс поиска\n"
-        "/more — показать ещё\n"
-        "/help — справка\n"
-        "/export — экспорт результатов\n"
-        "/stats — сколько раз искали\n"
-        "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
-    )
-
-async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = user_state.get(user_id)
-    if not state:
-        await update.message.reply_text("Сначала выполните поиск.")
-        return
-    query, offset, results = state["query"], state["offset"], state["results"]
-    page = results.iloc[offset: offset + 5]
-    for _, row in page.iterrows():
-        text = format_row(row)
-        await send_row_with_image(update, row, text)
-    offset += 5
-    user_state[user_id]["offset"] = offset
-    if offset < len(results):
-        await update.message.reply_text("Напишите /more для следующих результатов.")
-    else:
-        await update.message.reply_text("Больше результатов нет.")
-
-async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = user_state.get(user_id)
-    if not state:
-        await update.message.reply_text("Сначала выполните поиск.")
-        return
-    filename = f"export_{user_id}.xlsx"
-    state["results"].to_excel(filename, index=False)
-    with open(filename, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename))
-    os.remove(filename)
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = search_count.get(user_id, 0)
-    await update.message.reply_text(f"🔍 Вы сделали {count} поисков за сессию.")
 
 # Поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,11 +214,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Основной запуск
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("more", more))
-    app.add_handler(CommandHandler("export", export))
-    app.add_handler(CommandHandler("stats", stats))
 
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
@@ -279,8 +223,8 @@ def main():
         },
         fallbacks=[],
     )
-    app.add_handler(conv_handler)
 
+    app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
