@@ -36,7 +36,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}
-issue_state = {}  # {user_id: {"part": ..., "quantity": ...}}
+issue_state = {}  # Хранит: {user_id: {"part": ..., "quantity": ...}}
 search_count = {}
 
 # Админы
@@ -227,7 +227,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка добавления пользователя: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении пользователя.")
 
-# --- Обработка кнопок меню (ТОЛЬКО меню, НЕ мешает диалогу) ---
+# --- Обработка кнопок меню ---
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -297,6 +297,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Списание ---
 async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global issue_state
     query = update.callback_query
     user_id = query.from_user.id
 
@@ -321,7 +322,6 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❗ Деталь не найдена.")
         return ConversationHandler.END
 
-    global issue_state
     issue_state[user_id] = {"part": part[0]}
     await query.message.reply_text("🔢 Введите количество:")
     return ASK_QUANTITY
@@ -331,8 +331,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # 🔽 Лог для отладки
-    logger.info(f"📝 handle_quantity вызван. user_id={user_id}, ввод: '{text}'")
+    logger.info(f"📝 handle_quantity: user_id={user_id}, ввод='{text}'")
 
     if not text.isdigit() or int(text) <= 0:
         await update.message.reply_text("Введите положительное число.")
@@ -350,7 +349,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     comment = update.message.text.strip()
 
-    logger.info(f"📝 handle_comment вызван. Комментарий: '{comment}'")
+    logger.info(f"📝 handle_comment: комментарий='{comment}'")
 
     data = issue_state.pop(user_id, {})
     part = data.get("part")
@@ -388,26 +387,33 @@ def main():
     app.add_handler(CommandHandler("adduser", add_user))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Списание — ДО всех текстовых обработчиков
+    # Списание — ДО ВСЕХ ОСТАЛЬНЫХ
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
         states={
-            ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity)],
-            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
+            ASK_QUANTITY: [
+                MessageHandler(filters.Regex(r"^\d+$"), handle_quantity)  # Только числа
+            ],
+            ASK_COMMENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=True
     )
     app.add_handler(conv_handler)
 
-    # Кнопки меню (ТОЛЬКО кнопки, не мешает диалогу)
+    # Кнопки меню
     app.add_handler(MessageHandler(
         filters.Regex('^(🔍 Поиск детали|📦 Взять деталь|📊 Мои списания|❓ Помощь)$'),
         handle_menu_buttons
     ))
 
-    # Поиск — ЛЮБОЙ другой текст (кроме команд)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+    # Поиск — ЛЮБОЙ ТЕКСТ, КРОМЕ ЧИСЕЛ
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"^\d+$"),
+        search
+    ))
 
     # Ошибки
     app.add_error_handler(error_handler)
