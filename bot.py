@@ -4,37 +4,66 @@ import pickle
 import json
 import gspread
 import re
+from datetime import datetime
 from google.oauth2.service_account import Credentials
-from telegram import Update, InputFile
+from telegram import (
+    Update,
+    InputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
-from pandas import DataFrame, ExcelWriter
+from pandas import DataFrame
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Этапы диалога списания
+ASK_QUANTITY, ASK_COMMENT = range(2)
+issue_state = {}
+
 # Админы
 ADMINS = {225177765}
 
-# Токен и Google Sheets настройки
+# Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-SHEET_NAME = "SAP"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Загрузка данных из Google Sheets
-def load_data():
+# Google Sheets подключение
+def get_gsheet():
     creds_info = json.loads(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open_by_url(SPREADSHEET_URL).worksheet(SHEET_NAME)
+    return client.open_by_url(SPREADSHEET_URL)
+
+# Загрузка данных
+def load_data():
+    sheet = get_gsheet().worksheet("SAP")
     return sheet.get_all_records()
+
+# Сохранение истории
+def save_issue_to_sheet(user, part, quantity, comment):
+    sheet = get_gsheet().worksheet("История")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append_row([
+        now,
+        user.id,
+        user.full_name,
+        part.get("наименование", ""),
+        part.get("код", ""),
+        quantity,
+        comment
+    ])
 
 # Инициализация данных
 raw_data = load_data()
@@ -45,12 +74,11 @@ df["код"] = df["код"].astype(str).str.strip().str.lower()
 # Состояние пользователя
 user_state = {}
 search_count = {}
-
 if os.path.exists("state.pkl"):
     with open("state.pkl", "rb") as f:
         user_state = pickle.load(f)
 
-# Нормализация запроса (оставляем кириллицу, латиницу, цифры и пробелы)
+# Нормализация текста
 def normalize(text: str) -> str:
     return re.sub(r'[^\w\s]', '', text.lower()).strip()
 
@@ -62,13 +90,40 @@ def find_image_url_by_code(code: str) -> str:
             return url
     return ""
 
-# Команда /start
+# Форматирование строки результата
+def format_row(row):
+    return (
+        f"🔹 Тип: {row['тип']}\n"
+        f"📦 Наименование: {row['наименование']}\n"
+        f"🔢 Код: {row['код']}\n"
+        f"📦 Кол-во: {row['количество']}\n"
+        f"💰 Цена: {row['цена']} {row['валюта']}\n"
+        f"🏭 Изготовитель: {row['изготовитель']}\n"
+        f"⚙️ OEM: {row['oem']}"
+    )
+
+# Отправка строки с изображением и кнопкой
+async def send_row_with_image(update: Update, row, text: str):
+    code = str(row.get("код", ""))
+    image_url = find_image_url_by_code(code)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]
+    ])
+    if image_url:
+        try:
+            await update.message.reply_photo(photo=image_url, caption=text[:1024], reply_markup=keyboard)
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке фото: {e}")
+            await update.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+# Команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
-# Команда /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\U0001F4D8 Команды:\n"
@@ -80,7 +135,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправьте текст — для поиска по типу, коду, OEM, названию или изготовителю."
     )
 
-# Команда /more
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id)
@@ -99,32 +153,6 @@ async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Больше результатов нет.")
 
-# Форматирование строки ответа
-def format_row(row):
-    return (
-        f"🔹 Тип: {row['тип']}\n"
-        f"📦 Наименование: {row['наименование']}\n"
-        f"🔢 Код: {row['код']}\n"
-        f"📦 Кол-во: {row['количество']}\n"
-        f"💰 Цена: {row['цена']} {row['валюта']}\n"
-        f"🏭 Изготовитель: {row['изготовитель']}\n"
-        f"⚙️ OEM: {row['oem']}"
-    )
-
-# Отправка строки с изображением (если есть)
-async def send_row_with_image(update: Update, row, text: str):
-    code = str(row.get("код", ""))
-    image_url = find_image_url_by_code(code)
-    if image_url:
-        try:
-            await update.message.reply_photo(photo=image_url, caption=text[:1024])
-        except Exception as e:
-            logger.warning(f"Ошибка при отправке фото: {e}")
-            await update.message.reply_text(text)
-    else:
-        await update.message.reply_text(text)
-
-# Команда /export
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id)
@@ -137,7 +165,6 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(f, filename))
     os.remove(filename)
 
-# Команда /stats
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = search_count.get(user_id, 0)
@@ -185,6 +212,50 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(results) > 5:
         await update.message.reply_text("Показано 5 первых результатов. Напишите /more для продолжения.")
 
+# Списание: кнопка → кол-во → комментарий
+async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split(":")[1]
+    user_id = query.from_user.id
+
+    part = df[df["код"] == code].to_dict(orient="records")
+    if not part:
+        await query.edit_message_text("❗ Деталь не найдена.")
+        return ConversationHandler.END
+
+    issue_state[user_id] = {"part": part[0]}
+    await query.message.reply_text("Введите количество:")
+    return ASK_QUANTITY
+
+async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text.isdigit():
+        await update.message.reply_text("Введите число.")
+        return ASK_QUANTITY
+
+    issue_state[user_id]["quantity"] = int(text)
+    await update.message.reply_text("Введите комментарий (или напишите 'нет'):")
+    return ASK_COMMENT
+
+async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    comment = update.message.text.strip()
+    data = issue_state.pop(user_id, {})
+
+    part = data.get("part")
+    quantity = data.get("quantity")
+
+    if part and quantity:
+        save_issue_to_sheet(user, part, quantity, comment)
+        await update.message.reply_text("✅ Списание выполнено.")
+    else:
+        await update.message.reply_text("⚠ Что-то пошло не так.")
+    return ConversationHandler.END
+
 # Обработка ошибок
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка", exc_info=context.error)
@@ -199,6 +270,17 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
+        states={
+            ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity)],
+            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(conv_handler)
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_error_handler(error_handler)
     logger.info("Бот запущен")
