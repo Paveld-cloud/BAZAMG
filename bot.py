@@ -5,13 +5,14 @@ import json
 import gspread
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 from google.oauth2.service_account import Credentials
 from telegram import (
     Update,
     InputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -34,9 +35,9 @@ logger = logging.getLogger(__name__)
 ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
-user_state = {}          # Состояние поиска
-issue_state = {}         # Состояние списания
-search_count = {}        # Счётчик поисков
+user_state = {}
+issue_state = {}
+search_count = {}
 
 # Админы
 ADMINS = {225177765}
@@ -86,7 +87,6 @@ def load_data():
 # Асинхронное сохранение списания
 async def save_issue_to_sheet(context: ContextTypes.DEFAULT_TYPE, user, part, quantity, comment):
     try:
-        # 🔹 Время по Ташкенту
         tz = ZoneInfo("Asia/Tashkent")
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -115,12 +115,8 @@ df = DataFrame(raw_data)
 df.columns = df.columns.str.strip().str.lower()
 df["код"] = df["код"].astype(str).str.strip().str.lower()
 
-# --- 🔍 Поиск изображения: код содержится в URL (как в оригинальном коде) ---
+# --- Поиск изображения: код содержится в URL ---
 def find_image_url_by_code(code: str) -> str:
-    """
-    Ищет в столбце 'image' URL, содержащий код детали.
-    Пример: код 'uzcss06503' → найдёт URL, в котором встречается этот код.
-    """
     code_norm = re.sub(r'[^\w\s]', '', code.lower().strip())
     image_col = df["image"].astype(str)
     for url in image_col[image_col != "nan"]:
@@ -163,22 +159,38 @@ async def send_row_with_image(update: Update, row, text: str):
 
     await update.message.reply_text(text, reply_markup=keyboard)
 
+# --- Клавиатура меню ---
+def get_main_menu():
+    keyboard = [
+        ["🔍 Поиск детали", "📦 Взять деталь"],
+        ["📊 Мои списания", "❓ Помощь"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
 # --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
     search_count.pop(user_id, None)
-    await update.message.reply_text("Привет! Отправь название, код или OEM детали.")
+    await update.message.reply_text(
+        f"Привет, {update.effective_user.first_name}! 👋\n"
+        "Выберите действие в меню ниже:",
+        reply_markup=get_main_menu()
+    )
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Выберите действие:",
+        reply_markup=get_main_menu()
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔍 Бот для поиска и списания деталей\n\n"
-        "📌 Команды:\n"
-        "/start — начать\n"
-        "/help — справка\n"
-        "/cancel — отменить списание\n\n"
-        "Админ:\n"
-        "/adduser 123456789 — добавить пользователя"
+        "📌 Основное меню:\n"
+        "🔍 Поиск детали — найдите по коду, названию и т.д.\n"
+        "📦 Взять деталь — только после поиска\n"
+        "📊 Мои списания — ваши операции\n"
+        "❓ Помощь — это сообщение"
     )
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,29 +215,47 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Пользователь уже в списке.")
         else:
             sheet.append_row([str(new_user_id)])
-            get_allowed_users()  # Обновить кэш
+            get_allowed_users()
             await update.message.reply_text(f"✅ Пользователь {new_user_id} добавлен.")
     except Exception as e:
         logger.error(f"Ошибка добавления пользователя: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении пользователя.")
 
-# --- Поиск ---
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
+# --- Обработка меню и поиска ---
+async def handle_menu_or_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     user_id = update.effective_user.id
+
+    # Проверка доступа
     if user_id not in get_allowed_users():
         await update.message.reply_text("⛔ У вас нет доступа к этому боту.")
         return
 
-    query = update.message.text.strip()
-    if not query:
+    # Кнопки меню
+    if text == "🔍 Поиск детали":
+        await update.message.reply_text("Введите код, тип или название детали:")
+        return
+
+    elif text == "📦 Взять деталь":
+        await update.message.reply_text("Найдите деталь через поиск, затем нажмите кнопку 'Взять деталь' под карточкой.")
+        return
+
+    elif text == "📊 Мои списания":
+        await update.message.reply_text("Загрузка ваших списаний...")
+        # ← Здесь можно добавить чтение из "История" по user.id
+        await update.message.reply_text("Пока в разработке. Скоро!")
+        return
+
+    elif text == "❓ Помощь":
+        await help_command(update, context)
+        return
+
+    # Если не кнопка — значит, это запрос на поиск
+    if not text:
         await update.message.reply_text("Введите запрос.")
         return
 
-    norm_query = re.sub(r'[^\w\s]', '', query.lower())
-
+    norm_query = re.sub(r'[^\w\s]', '', text.lower())
     mask = (
         df["тип"].astype(str).apply(lambda x: norm_query in re.sub(r'[^\w\s]', '', x.lower())) |
         df["наименование"].astype(str).apply(lambda x: norm_query in re.sub(r'[^\w\s]', '', x.lower())) |
@@ -237,21 +267,20 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = df[mask].copy()
 
     if results.empty:
-        await update.message.reply_text(f'❌ По запросу "{query}" ничего не найдено.')
+        await update.message.reply_text(f'❌ По запросу "{text}" ничего не найдено.')
         return
 
     user_state[user_id] = {
-        "query": query,
+        "query": text,
         "offset": 5,
         "results": results
     }
 
     for _, row in results.head(5).iterrows():
-        text = format_row(row)
-        await send_row_with_image(update, row, text)
+        await send_row_with_image(update, row, format_row(row))
 
     if len(results) > 5:
-        await update.message.reply_text("Показано 5 результатов. Напишите /more для продолжения.")
+        await update.message.reply_text("Показано 5 результатов. Напишите ещё, чтобы увидеть больше.")
 
 # --- Списание ---
 async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,6 +358,7 @@ def main():
 
     # Команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("adduser", add_user))
     app.add_handler(CommandHandler("cancel", cancel))
@@ -341,17 +371,17 @@ def main():
             ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True  # Защита от старых кнопок
+        per_message=True
     )
     app.add_handler(conv_handler)
 
-    # Поиск (важно: после ConversationHandler!)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+    # Меню и поиск
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_or_search))
 
     # Ошибки
     app.add_error_handler(error_handler)
 
-    # Сохранение состояния при выходе
+    # Сохранение состояния
     def save_state():
         with open("state.pkl", "wb") as f:
             pickle.dump(user_state, f)
