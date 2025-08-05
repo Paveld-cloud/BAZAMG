@@ -36,7 +36,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}
-issue_state = {}
+issue_state = {}  # Хранит: {user_id: {"part": ..., "quantity": ...}}
 search_count = {}
 
 # Админы
@@ -101,6 +101,7 @@ async def save_issue_to_sheet(context: ContextTypes.DEFAULT_TYPE, user, part, qu
             quantity,
             comment
         ])
+        logger.info(f"Списание сохранено: {part['код']} x{quantity}")
     except Exception as e:
         logger.error(f"Ошибка при сохранении списания: {e}")
         for admin_id in ADMINS:
@@ -112,14 +113,19 @@ async def save_issue_to_sheet(context: ContextTypes.DEFAULT_TYPE, user, part, qu
 # Инициализация данных
 raw_data = load_data()
 df = DataFrame(raw_data)
-df.columns = df.columns.str.strip().str.lower()
-df["код"] = df["код"].astype(str).str.strip().str.lower()
+if df.empty:
+    logger.error("⚠️ Таблица SAP пуста или не загружена")
+else:
+    df.columns = df.columns.str.strip().str.lower()
+    df["код"] = df["код"].astype(str).str.strip().str.lower()
 
 # --- Поиск изображения: код содержится в URL ---
 def find_image_url_by_code(code: str) -> str:
+    if df.empty:
+        return ""
     code_norm = re.sub(r'[^\w\s]', '', code.lower().strip())
-    image_col = df["image"].astype(str)
-    for url in image_col[image_col != "nan"]:
+    image_col = df["image"].dropna().astype(str)  # Убираем nan
+    for url in image_col:
         url_norm = re.sub(r'[^\w\s]', '', url.lower().strip())
         if code_norm in url_norm:
             return url
@@ -139,7 +145,7 @@ def format_row(row):
 
 # Отправка строки с изображением и кнопкой
 async def send_row_with_image(update: Update, row, text: str):
-    if not update.message:
+    if not update.message or df.empty:
         return
 
     code = str(row.get("код", ""))
@@ -221,37 +227,47 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка добавления пользователя: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении пользователя.")
 
-# --- Обработка меню и поиска ---
-async def handle_menu_or_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+# --- Обработка меню ---
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     user_id = update.effective_user.id
 
-    # Проверка доступа
     if user_id not in get_allowed_users():
         await update.message.reply_text("⛔ У вас нет доступа к этому боту.")
         return
 
-    # Кнопки меню
     if text == "🔍 Поиск детали":
         await update.message.reply_text("Введите код, тип или название детали:")
-        return
-
+    
     elif text == "📦 Взять деталь":
-        await update.message.reply_text("Найдите деталь через поиск, затем нажмите кнопку 'Взять деталь' под карточкой.")
-        return
-
+        await update.message.reply_text("Найдите деталь через поиск, затем нажмите 'Взять деталь' под карточкой.")
+    
     elif text == "📊 Мои списания":
-        await update.message.reply_text("Загрузка ваших списаний...")
-        # ← Здесь можно добавить чтение из "История" по user.id
         await update.message.reply_text("Пока в разработке. Скоро!")
-        return
-
+    
     elif text == "❓ Помощь":
         await help_command(update, context)
+
+# --- Обработка поиска (только если НЕ в диалоге списания) ---
+async def handle_menu_or_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # 🔁 Если идёт списание — НЕ перехватываем
+    if user_id in issue_state:
+        return  # Пусть работает ConversationHandler
+
+    text = update.message.text.strip()
+
+    # Это кнопка меню?
+    if text in ["🔍 Поиск детали", "📦 Взять деталь", "📊 Мои списания", "❓ Помощь"]:
+        return await handle_menu(update, context)
+
+    # Проверка доступа
+    if user_id not in get_allowed_users():
+        await update.message.reply_text("⛔ У вас нет доступа.")
         return
 
-    # Если не кнопка — значит, это запрос на поиск
-    if not text:
+    if not text or df.empty:
         await update.message.reply_text("Введите запрос.")
         return
 
@@ -287,8 +303,6 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user_id = query.from_user.id
 
-    logger.info(f"Получен callback: {query.data} от user_id={user_id}")
-
     if user_id not in get_allowed_users():
         await query.answer("⛔ Доступ запрещён", show_alert=True)
         return ConversationHandler.END
@@ -301,16 +315,22 @@ async def handle_issue_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("⚠ Ошибка: неверный код детали.")
         return ConversationHandler.END
 
+    if df.empty:
+        await query.message.reply_text("⚠ Данные не загружены.")
+        return ConversationHandler.END
+
     part = df[df["код"] == code.lower().strip()].to_dict(orient="records")
     if not part:
         await query.edit_message_text("❗ Деталь не найдена.")
         return ConversationHandler.END
 
+    global issue_state
     issue_state[user_id] = {"part": part[0]}
     await query.message.reply_text("🔢 Введите количество:")
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global issue_state
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -323,24 +343,26 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global issue_state
     user = update.effective_user
     user_id = user.id
     comment = update.message.text.strip()
-    data = issue_state.pop(user_id, {})
 
+    data = issue_state.pop(user_id, {})
     part = data.get("part")
     quantity = data.get("quantity")
 
-    logger.info(f"Сохранение списания: код={part.get('код')}, кол-во={quantity}, коммент={comment}")
+    logger.info(f"Сохранение списания: {part.get('код') if part else 'None'}, кол-во: {quantity}, коммент: {comment}")
 
     if part and quantity:
         await save_issue_to_sheet(context, user, part, quantity, comment)
         await update.message.reply_text("✅ Списание выполнено.")
     else:
-        await update.message.reply_text("⚠ Ошибка при списании.")
+        await update.message.reply_text("⚠ Ошибка: не удалось сохранить списание.")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global issue_state
     user_id = update.effective_user.id
     issue_state.pop(user_id, None)
     await update.message.reply_text("❌ Списание отменено.")
@@ -363,7 +385,7 @@ def main():
     app.add_handler(CommandHandler("adduser", add_user))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Списание
+    # Списание — ДО общего MessageHandler
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
         states={
@@ -375,7 +397,7 @@ def main():
     )
     app.add_handler(conv_handler)
 
-    # Меню и поиск
+    # Меню и поиск — только если не в диалоге
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_or_search))
 
     # Ошибки
