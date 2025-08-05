@@ -18,8 +18,8 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 from pandas import DataFrame
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ASK_QUANTITY, ASK_COMMENT = range(2)
 issue_state = {}
 
-# Админы
+# Админы и разрешённые пользователи
 ADMINS = {225177765}
 
 # Переменные окружения
@@ -51,7 +51,7 @@ def load_data():
     sheet = get_gsheet().worksheet("SAP")
     return sheet.get_all_records()
 
-# Сохранение истории с типом
+# Сохранение истории
 def save_issue_to_sheet(user, part, quantity, comment):
     sheet = get_gsheet().worksheet("История")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -65,6 +65,27 @@ def save_issue_to_sheet(user, part, quantity, comment):
         quantity,
         comment
     ])
+
+# Команда /adduser — добавляет user_id в таблицу "Пользователи"
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("⛔ У вас нет прав на выполнение этой команды.")
+        return
+
+    try:
+        new_user_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠ Использование: /adduser 123456789")
+        return
+
+    sheet = get_gsheet().worksheet("Пользователи")
+    existing_ids = [row[0] for row in sheet.get_all_values()]
+    if str(new_user_id) in existing_ids:
+        await update.message.reply_text("✅ Пользователь уже есть в списке.")
+    else:
+        sheet.append_row([str(new_user_id)])
+        await update.message.reply_text(f"✅ Добавлен user_id: {new_user_id}")
 
 # Инициализация данных
 raw_data = load_data()
@@ -214,6 +235,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Основной запуск
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Команда добавления пользователя
+    app.add_handler(CommandHandler("adduser", add_user))
 
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_issue_button, pattern=r"^issue:")],
