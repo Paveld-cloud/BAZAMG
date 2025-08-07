@@ -5,7 +5,7 @@ import json
 import gspread
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Встроено в Python 3.9+
+from zoneinfo import ZoneInfo
 from google.oauth2.service_account import Credentials
 from telegram import (
     Update,
@@ -35,7 +35,7 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # Глобальные состояния
 user_state = {}
-issue_state = {}  # Хранит: {user_id: {"part": ..., "quantity": ...}}
+issue_state = {}  # {user_id: {"part": ..., "quantity": ...}}
 search_count = {}
 
 # Админы
@@ -44,7 +44,7 @@ ADMINS = {225177765}
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # Без пробелов
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 if not TELEGRAM_TOKEN or not SPREADSHEET_URL:
     raise EnvironmentError("Отсутствуют TELEGRAM_TOKEN или SPREADSHEET_URL в переменных окружения")
@@ -56,19 +56,9 @@ def get_gsheet():
     client = gspread.authorize(creds)
     return client.open_by_url(SPREADSHEET_URL)
 
-# Загрузка данных
-def load_data():
-    try:
-        sheet = get_gsheet().worksheet("SAP")
-        return sheet.get_all_records()
-    except Exception as e:
-        logger.error(f"Ошибка загрузки данных SAP: {e}")
-        return []
-
 # Сохранение списания — с временем по Ташкенту
 def save_issue_to_sheet(user, part, quantity, comment):
     try:
-        # 🔹 Время по Ташкенту (UTC+5)
         tz = ZoneInfo("Asia/Tashkent")
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -87,12 +77,20 @@ def save_issue_to_sheet(user, part, quantity, comment):
         logger.error(f"❌ Ошибка при сохранении списания: {e}")
         for admin_id in ADMINS:
             try:
-                # Попробуем уведомить админа (если бот ещё работает)
                 import asyncio
                 loop = asyncio.get_event_loop()
                 loop.create_task(ContextTypes.DEFAULT_TYPE.bot.send_message(admin_id, f"⚠️ Ошибка сохранения списания: {e}"))
             except:
                 pass
+
+# Загрузка данных
+def load_data():
+    try:
+        sheet = get_gsheet().worksheet("SAP")
+        return sheet.get_all_records()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки данных SAP: {e}")
+        return []
 
 # Инициализация данных
 raw_data = load_data()
@@ -156,6 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
     search_count.pop(user_id, None)
+    issue_state.pop(user_id, None)  # 🔽 Очистка списания
     await update.message.reply_text("Привет! История поиска очищена.\nОтправь тип, код или наименование детали.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,8 +164,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/more — показать ещё\n"
         "/export — экспорт результатов\n"
         "/stats — сколько раз искали\n"
+        "/cancel — отменить списание\n"
         "Отправьте текст — для поиска."
     )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in issue_state:
+        issue_state.pop(user_id, None)
+        await update.message.reply_text("❌ Списание отменено.")
+    else:
+        await update.message.reply_text("Нет активного списания для отмены.")
 
 async def more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -213,6 +221,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Поиск
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # 🔁 Если идёт списание — отменяем
+    if user_id in issue_state:
+        logger.info(f"❌ Списание прервано — начат новый поиск (user_id={user_id})")
+        issue_state.pop(user_id, None)
+        await update.message.reply_text("⚠ Списание отменено: начат новый поиск.")
+
     query = update.message.text.strip().lower()
     norm_query = normalize(query)
 
@@ -312,6 +327,7 @@ def main():
     app.add_handler(CommandHandler("more", more))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("cancel", cancel))  # 🔽 Добавлено
 
     # Списание
     conv_handler = ConversationHandler(
@@ -320,12 +336,14 @@ def main():
             ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity)],
             ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
 
-    # Поиск
+    # Поиск — ЛЮБОЙ ТЕКСТ
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+
+    # Ошибки
     app.add_error_handler(error_handler)
 
     # Сохранение состояния при выходе
