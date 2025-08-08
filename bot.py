@@ -50,8 +50,8 @@ if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON or not WEBHOOK_UR
         "GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL"
     )
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # R/W
-DATA_TTL = 300         # сек, авто-перезагрузка данных
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # чтение/запись
+DATA_TTL = 300         # сек до авто-перезагрузки данных
 PAGE_SIZE = 5          # карточек на страницу
 
 ASK_QUANTITY, ASK_COMMENT = range(2)
@@ -60,8 +60,11 @@ ASK_QUANTITY, ASK_COMMENT = range(2)
 df: DataFrame | None = None
 _last_load_ts = 0.0
 
-user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
-issue_state: dict[int, dict] = {}  # { user_id: {"part": dict(row), "quantity": float|int} }
+# { user_id: { "query": str, "results": DataFrame, "page": int } }
+user_state: dict[int, dict] = {}
+
+# { user_id: {"part": dict(row), "quantity": float|int, "await_comment": bool} }
+issue_state: dict[int, dict] = {}
 
 # ===================== GOOGLE SHEETS =====================
 def get_gs_client():
@@ -246,11 +249,21 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InputFile(io.BytesIO(csv_data.encode("utf-8-sig")), filename=f"export_{user_id}.csv")
         )
 
-# ===================== ПОИСК =====================
+# ===================== ПОИСК (с гейтом, чтобы не мешал диалогу списания) =====================
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
     if update.message is None:
         return
+
+    user_id = update.effective_user.id
+
+    # 🔒 Если идёт диалог списания — отключаем поиск и подсказываем следующий шаг
+    st = issue_state.get(user_id)
+    if st:
+        if "quantity" not in st:
+            return await update.message.reply_text("Вы сейчас вводите количество для списания. Введите число или /cancel.")
+        if st.get("await_comment"):
+            return await update.message.reply_text("Вы сейчас вводите комментарий для списания. Напишите текст или «-», либо /cancel.")
 
     query = update.message.text.strip()
     if not query:
@@ -273,7 +286,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     matches.sort(key=lambda x: x[0], reverse=True)
     results_df = DataFrame([r for _, r in matches])
 
-    user_id = update.effective_user.id
     state = get_user_state(user_id)
     state["query"] = query
     state["results"] = results_df
@@ -335,7 +347,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not found:
         return await query.edit_message_text("Не удалось найти деталь по коду. Обновите список или выполните поиск заново.")
 
-    issue_state[user_id] = {"part": found}
+    issue_state[user_id] = {"part": found}  # quantity ещё нет
     await query.message.reply_text("Сколько списать? Укажите число (например: 1 или 2.5).")
     return ASK_QUANTITY
 
@@ -350,10 +362,11 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Введите положительное число, например: 1 или 2.5")
 
     st = issue_state.get(user_id)
-    if not st:
+    if not st or "part" not in st:
         return await update.message.reply_text("Списание неактивно. Начните заново, нажав «📦 Взять деталь» в карточке.")
 
     st["quantity"] = qty
+    st["await_comment"] = True  # ⛳ теперь ждём комментарий — поиск игнорируется
     await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).")
     return ASK_COMMENT
 
@@ -397,7 +410,7 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Диалог списания
+    # Диалог списания (важно добавить ДО поиска)
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
@@ -406,12 +419,12 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
-        per_message=True,  # важно для корректной работы с CallbackQuery start
+        # per_message не используем — чтобы не ловить warning, порядок и гейт уже защищают
     )
     app.add_handler(conv)
 
-    # Поиск — любое текстовое сообщение
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text))
+    # Поиск — в группе 1, чтобы отрабатывать ПОСЛЕ диалога списания
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
 
     return app
 
