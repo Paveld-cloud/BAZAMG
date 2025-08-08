@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bot")
 
 # ===================== НАСТРОЙКИ =====================
-ADMINS = {225177765}  # замените на свои ID при необходимости
+ADMINS = {225177765}  # замените на свои ID
 
 # ENV
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -62,9 +62,15 @@ _last_load_ts = 0.0
 
 # { user_id: { "query": str, "results": DataFrame, "page": int } }
 user_state: dict[int, dict] = {}
-
 # { user_id: {"part": dict(row), "quantity": float|int, "await_comment": bool} }
 issue_state: dict[int, dict] = {}
+
+# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
+def cancel_markup():
+    """Инлайн-кнопка отмены для шагов диалога."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]
+    ])
 
 # ===================== GOOGLE SHEETS =====================
 def get_gs_client():
@@ -223,47 +229,32 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Данные перезагружены.")
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel на всякий — оставим тоже."""
     user_id = update.effective_user.id
     if issue_state.pop(user_id, None):
         await update.message.reply_text("Операция списания отменена.")
     else:
         await update.message.reply_text("Нет активной операции для отмены.")
 
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = get_user_state(user_id)
-    results: DataFrame = state.get("results") or DataFrame()
-    if results.empty:
-        return await update.message.reply_text("Сначала выполните поиск.")
-
-    try:
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            results.to_excel(writer, index=False)
-        output.seek(0)
-        await update.message.reply_document(InputFile(output, filename=f"export_{user_id}.xlsx"))
-    except Exception as e:
-        logger.warning(f"XLSX не удалось, отправляем CSV: {e}")
-        csv_data = results.to_csv(index=False, encoding="utf-8-sig")
-        await update.message.reply_document(
-            InputFile(io.BytesIO(csv_data.encode("utf-8-sig")), filename=f"export_{user_id}.csv")
-        )
-
-# ===================== ПОИСК (с гейтом, чтобы не мешал диалогу списания) =====================
+# ===================== ПОИСК (с гейтом) =====================
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
     if update.message is None:
         return
 
+    # 🔕 если пред. хендлер пометил "не искать" — пропускаем
+    if context.chat_data.pop("suppress_next_search", False):
+        return
+
     user_id = update.effective_user.id
 
-    # 🔒 Если идёт диалог списания — отключаем поиск и подсказываем следующий шаг
+    # 🔒 идёт диалог списания — не запускаем поиск
     st = issue_state.get(user_id)
     if st:
         if "quantity" not in st:
-            return await update.message.reply_text("Вы сейчас вводите количество для списания. Введите число или /cancel.")
+            return await update.message.reply_text("Вы сейчас вводите количество для списания. Введите число или нажмите «Отменить».", reply_markup=cancel_markup())
         if st.get("await_comment"):
-            return await update.message.reply_text("Вы сейчас вводите комментарий для списания. Напишите текст или «-», либо /cancel.")
+            return await update.message.reply_text("Вы сейчас вводите комментарий для списания. Напишите текст или «-», либо нажмите «Отменить».", reply_markup=cancel_markup())
 
     query = update.message.text.strip()
     if not query:
@@ -348,7 +339,10 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await query.edit_message_text("Не удалось найти деталь по коду. Обновите список или выполните поиск заново.")
 
     issue_state[user_id] = {"part": found}  # quantity ещё нет
-    await query.message.reply_text("Сколько списать? Укажите число (например: 1 или 2.5).")
+    await query.message.reply_text(
+        "Сколько списать? Укажите число (например: 1 или 2.5).",
+        reply_markup=cancel_markup()
+    )
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,7 +353,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if qty <= 0:
             raise ValueError
     except Exception:
-        return await update.message.reply_text("Введите положительное число, например: 1 или 2.5")
+        return await update.message.reply_text("Введите положительное число, например: 1 или 2.5", reply_markup=cancel_markup())
 
     st = issue_state.get(user_id)
     if not st or "part" not in st:
@@ -367,7 +361,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True  # ⛳ теперь ждём комментарий — поиск игнорируется
-    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).")
+    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,8 +377,12 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         issue_state.pop(user_id, None)
         return await update.message.reply_text("Что-то пошло не так, попробуйте ещё раз.")
 
+    # 🔕 помечаем, что следующий обработчик (поиск) для ЭТОГО апдейта нужно пропустить
+    context.chat_data["suppress_next_search"] = True
+
     save_issue_to_sheet(context.bot, update.effective_user, part, qty, "" if comment == "-" else comment)
     issue_state.pop(user_id, None)
+    user_state.pop(user_id, None)
 
     await update.message.reply_text(
         f"✅ Списано: {qty}\n"
@@ -394,7 +392,22 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инлайн-кнопка 'Отменить' в любом шаге диалога."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    issue_state.pop(user_id, None)
+    user_state.pop(user_id, None)
+    # На всякий случай — чтобы это нажатие не триггернуло поиск
+    context.chat_data["suppress_next_search"] = True
+
+    await query.message.reply_text("❌ Операция списания отменена.")
+    return ConversationHandler.END
+
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # поддержим и /cancel
     await cancel_cmd(update, context)
     return ConversationHandler.END
 
@@ -410,20 +423,31 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Диалог списания (важно добавить ДО поиска)
+    # Диалог списания (добавляем ДО поиска)
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
+        entry_points=[
+            CallbackQueryHandler(on_issue_click, pattern=r"^issue:"),
+            CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+        ],
         states={
-            ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity)],
-            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment)],
+            ASK_QUANTITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity),
+                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+            ],
+            ASK_COMMENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment),
+                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
+        fallbacks=[
+            CommandHandler("cancel", handle_cancel_in_dialog),
+            CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+        ],
         allow_reentry=True,
-        # per_message не используем — чтобы не ловить warning, порядок и гейт уже защищают
     )
     app.add_handler(conv)
 
-    # Поиск — в группе 1, чтобы отрабатывать ПОСЛЕ диалога списания
+    # Поиск — в группе 1, чтобы сработал только если диалог не поглотил апдейт
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
 
     return app
