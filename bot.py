@@ -33,74 +33,60 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bot")
 
 # ===================== НАСТРОЙКИ =====================
-# Админы (замените на свои ID)
-ADMINS = {225177765}
+ADMINS = {225177765}  # замените на свои ID при необходимости
 
-# Переменные окружения
+# ENV
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")  # опционально
 
-if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON:
-    raise RuntimeError("Отсутствуют обязательные переменные окружения: TELEGRAM_TOKEN / SPREADSHEET_URL / GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON or not WEBHOOK_URL:
+    raise RuntimeError(
+        "Нужно задать ENV: TELEGRAM_TOKEN, SPREADSHEET_URL, "
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL"
+    )
 
-# Google Sheets SCOPES — доступ на чтение/запись
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # R/W
+DATA_TTL = 300         # сек, авто-перезагрузка данных
+PAGE_SIZE = 5          # карточек на страницу
 
-# Параметры данных/поиска/вывода
-DATA_TTL = 300  # сек, 5 минут до авто-перезагрузки из таблицы
-PAGE_SIZE = 5   # сколько карточек на страницу
-
-# Этапы диалога списания
 ASK_QUANTITY, ASK_COMMENT = range(2)
 
 # ===================== ГЛОБАЛЬНЫЕ СОСТОЯНИЯ =====================
 df: DataFrame | None = None
 _last_load_ts = 0.0
 
-# user_state: хранит результаты последнего поиска и позицию пагинации
-# { user_id: { "query": str, "results": DataFrame, "page": int } }
-user_state: dict[int, dict] = {}
+user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
+issue_state: dict[int, dict] = {}  # { user_id: {"part": dict(row), "quantity": float|int} }
 
-# issue_state: хранит процесс списания на пользователя
-# { user_id: {"part": dict(row), "quantity": float|int} }
-issue_state: dict[int, dict] = {}
-
-
-# ===================== УТИЛИТЫ GOOGLE SHEETS =====================
+# ===================== GOOGLE SHEETS =====================
 def get_gs_client():
     creds_info = json.loads(CREDS_JSON)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return client
+    return gspread.authorize(creds)
 
 def load_data() -> list[dict]:
-    """Считывает ПЕРВЫЙ лист в таблице SPREADSHEET_URL построчно как dict."""
     client = get_gs_client()
     sheet = client.open_by_url(SPREADSHEET_URL)
-    ws = sheet.sheet1  # первый лист по умолчанию
-    rows = ws.get_all_records()
-    return rows
+    ws = sheet.sheet1
+    return ws.get_all_records()
 
 def ensure_fresh_data(force: bool = False):
-    """Перезагрузка кэша данных из Google Sheet по TTL или по запросу."""
     global df, _last_load_ts
     if force or (time.time() - _last_load_ts > DATA_TTL) or df is None:
         raw = load_data()
         new_df = DataFrame(raw)
-        if not len(new_df):
-            logger.warning("Лист пуст или не прочитан.")
-        # приведение названий колонок к нижнему регистру без пробелов по краям
         new_df.columns = new_df.columns.str.strip().str.lower()
-
-        # нормализация ключевых колонок
         for col in ["код", "oem"]:
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
-
         df = new_df
         _last_load_ts = time.time()
-        logger.info(f"✅ Загружено {len(df)} строк из таблицы")
+        logger.info(f"✅ Загружено {len(df)} строк из Google Sheet")
 
 # ===================== ПОИСК =====================
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
@@ -109,22 +95,26 @@ def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
 
 def match_row(row: dict, tokens: list[str]) -> int:
-    """Подсчет простого скора: все токены найдены — +1, если поле 'код' или 'oem' — +2."""
     score = 0
     for field in SEARCH_FIELDS:
         val = normalize(str(row.get(field, "")))
-        if not val:
-            continue
-        if all(tok in val for tok in tokens):
+        if val and all(tok in val for tok in tokens):
             score += 2 if field in ("код", "oem") else 1
     return score
 
 def val(row: dict, key: str, default: str = "—") -> str:
     v = row.get(key)
-    return default if v in (None, "", float("nan")) else str(v)
+    if v is None:
+        return default
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return default
+    except Exception:
+        pass
+    s = str(v).strip()
+    return s if s else default
 
 def format_row(row: dict) -> str:
-    """Человекочитаемый блок информации по детали."""
     return (
         f"🔹 Тип: {val(row, 'тип')}\n"
         f"📦 Наименование: {val(row, 'наименование')}\n"
@@ -136,16 +126,13 @@ def format_row(row: dict) -> str:
     )
 
 def get_row_image(row: dict) -> str:
-    """Возвращает URL изображения для строки, если он есть в одной из типовых колонок."""
     for key in ("image", "изображение", "photo", "фото"):
-        if key in row:
-            url = row.get(key)
-            if isinstance(url, str) and url.strip():
-                return url.strip()
+        url = row.get(key)
+        if isinstance(url, str) and url.strip():
+            return url.strip()
     return ""
 
 async def send_row_with_image(update: Update, row: dict, text: str):
-    """Отправка карточки: фото (если есть) + кнопка 'Взять деталь'."""
     code = str(row.get("код", "")).strip().lower()
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]
@@ -157,16 +144,15 @@ async def send_row_with_image(update: Update, row: dict, text: str):
             await update.message.reply_photo(photo=image_url, caption=text, reply_markup=keyboard)
             return
         except Exception as e:
-            logger.warning(f"Не удалось отправить фото, шлём текст. Причина: {e}")
+            logger.warning(f"Фото не отправилось, шлём текст. Причина: {e}")
 
     await update.message.reply_text(text, reply_markup=keyboard)
 
 def get_user_state(user_id: int) -> dict:
     return user_state.setdefault(user_id, {"query": "", "results": DataFrame(), "page": 0})
 
-# ===================== СОХРАНЕНИЕ СПИСАНИЯ =====================
+# ===================== ИСТОРИЯ СПИСАНИЙ =====================
 def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    """Пишем списание в лист 'История'. Создадим лист если его нет."""
     try:
         client = get_gs_client()
         sh = client.open_by_url(SPREADSHEET_URL)
@@ -192,7 +178,6 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
         logger.info("💾 Списание записано в 'История'")
     except Exception as e:
         logger.error(f"❌ Ошибка при сохранении списания: {e}")
-        # попробуем сообщить админам асинхронно
         async def notify_admins():
             for admin_id in ADMINS:
                 try:
@@ -201,37 +186,35 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
                     pass
         asyncio.create_task(notify_admins())
 
-# ===================== ХЕНДЛЕРЫ КОМАНД =====================
+# ===================== КОМАНДЫ =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # сброс незавершённых процессов списания
     issue_state.pop(user_id, None)
     await update.message.reply_text(
-        "Привет! Отправь мне запрос (например: `фильтр масла` или `96353000`),\n"
-        "а я найду детали. Команды:\n"
+        "Привет! Напиши запрос (например: `фильтр масла` или `96353000`).\n"
+        "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
         "• /export — выгрузка результатов (XLSX/CSV)\n"
         "• /cancel — отменить списание\n"
         "• /reload — перезагрузить данные (только админ)",
-        parse_mode="Markdown",
+        parse_mode="Markdown"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Как пользоваться:\n"
-        "1) Просто напишите слова для поиска (можно несколько).\n"
-        "2) Нажмите «📦 Взять деталь» чтобы списать — бот спросит количество и комментарий.\n"
+        "1) Пишите слова для поиска (можно несколько).\n"
+        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий.\n"
         "Команды:\n"
-        "• /more — следующая страница результатов\n"
-        "• /export — выгрузка результатов\n"
-        "• /cancel — отмена незавершённого списания\n"
+        "• /more — следующая страница\n"
+        "• /export — экспорт результатов\n"
+        "• /cancel — отмена списания\n"
         "• /reload — перезагрузка данных (админ)"
     )
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
+    if update.effective_user.id not in ADMINS:
         return await update.message.reply_text("Доступ запрещён.")
     ensure_fresh_data(force=True)
     await update.message.reply_text("✅ Данные перезагружены.")
@@ -248,9 +231,8 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     results: DataFrame = state.get("results") or DataFrame()
     if results.empty:
-        return await update.message.reply_text("Сначала выполните поиск, чтобы было что экспортировать.")
+        return await update.message.reply_text("Сначала выполните поиск.")
 
-    # Пробуем XLSX, если нет openpyxl — падём в CSV
     try:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -258,15 +240,14 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         output.seek(0)
         await update.message.reply_document(InputFile(output, filename=f"export_{user_id}.xlsx"))
     except Exception as e:
-        logger.warning(f"XLSX не удалось, шлём CSV: {e}")
+        logger.warning(f"XLSX не удалось, отправляем CSV: {e}")
         csv_data = results.to_csv(index=False, encoding="utf-8-sig")
         await update.message.reply_document(
             InputFile(io.BytesIO(csv_data.encode("utf-8-sig")), filename=f"export_{user_id}.csv")
         )
 
-# ===================== ПОИСК И ВЫВОД РЕЗУЛЬТАТОВ =====================
+# ===================== ПОИСК =====================
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает обычные сообщения как запросы поиска."""
     ensure_fresh_data()
     if update.message is None:
         return
@@ -280,7 +261,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Введите более конкретный запрос.")
 
     matches = []
-    # идём по строкам DataFrame и считаем скор
     for _, row in df.iterrows():
         rdict = row.to_dict()
         s = match_row(rdict, tokens)
@@ -290,11 +270,9 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matches:
         return await update.message.reply_text(f"По запросу «{query}» ничего не найдено.")
 
-    # сортировка по релевантности
     matches.sort(key=lambda x: x[0], reverse=True)
     results_df = DataFrame([r for _, r in matches])
 
-    # сохраняем состояние пользователя
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     state["query"] = query
@@ -304,7 +282,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_page(update, user_id)
 
 async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает следующую страницу найденного."""
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     if not isinstance(state.get("results"), DataFrame) or state["results"].empty:
@@ -329,7 +306,6 @@ async def send_page(update: Update, user_id: int):
 
     await update.message.reply_text(f"Найдено: {total}. Показываю {start + 1}–{end} из {total}.")
 
-    # выводим карточки
     for _, row in chunk.iterrows():
         text = format_row(row.to_dict())
         await send_row_with_image(update, row.to_dict(), text)
@@ -348,8 +324,8 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     code = data.split(":", 1)[1].strip().lower()
-    # находим строку по 'код'
     ensure_fresh_data()
+
     found = None
     if df is not None and "код" in df.columns:
         hit = df[df["код"].astype(str).str.lower() == code]
@@ -409,7 +385,7 @@ async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_
     await cancel_cmd(update, context)
     return ConversationHandler.END
 
-# ===================== MAIN =====================
+# ===================== APP/WEBHOOK =====================
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -441,5 +417,21 @@ def build_app():
 if __name__ == "__main__":
     ensure_fresh_data(force=True)
     application = build_app()
-    logger.info("🚀 Бот запущен. Ожидание сообщений...")
-    application.run_polling(close_loop=False)
+
+    # Полный URL вебхука
+    webhook_full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+
+    logger.info(f"🚀 Стартуем webhook-сервер на 0.0.0.0:{PORT}")
+    logger.info(f"🌐 Устанавливаем webhook: {webhook_full_url}")
+
+    # Важно: Telegram требует HTTPS. Railway даёт HTTPS на вашем домене.
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        secret_token=WEBHOOK_SECRET_TOKEN or None,  # если задан
+        webhook_url=webhook_full_url,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        drop_pending_updates=True,
+        allowed_updates=None,  # все типы
+        restart_on_change=False,
+    )
