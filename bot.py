@@ -406,6 +406,7 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
+        per_message=True,  # важно для корректной работы с CallbackQuery start
     )
     app.add_handler(conv)
 
@@ -418,20 +419,16 @@ if __name__ == "__main__":
     ensure_fresh_data(force=True)
     application = build_app()
 
-    # Полный URL вебхука
     webhook_full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-
     logger.info(f"🚀 Стартуем webhook-сервер на 0.0.0.0:{PORT}")
     logger.info(f"🌐 Устанавливаем webhook: {webhook_full_url}")
 
-    # Важно: Telegram требует HTTPS. Railway даёт HTTPS на вашем домене.
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        secret_token=WEBHOOK_SECRET_TOKEN or None,  # если задан
+        secret_token=WEBHOOK_SECRET_TOKEN or None,
         webhook_url=webhook_full_url,
         url_path=WEBHOOK_PATH.lstrip("/"),
         drop_pending_updates=True,
-        allowed_updates=None,  # все типы
-        restart_on_change=False,
+        allowed_updates=None,
     )
