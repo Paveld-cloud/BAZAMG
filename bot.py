@@ -61,7 +61,13 @@ SHEET_ADMINS: set[int] = set()
 SHEET_BLOCKED: set[int] = set()
 _last_users_ts = 0.0
 
+# состояние поиска/выдачи результатов
 user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
+
+def get_user_state(user_id: int) -> dict:
+    return user_state.setdefault(user_id, {"query": "", "results": DataFrame(), "page": 0})
+
+# состояние операции списания
 issue_state: dict[int, dict] = {}  # { user_id: {"part": dict, "quantity": float, "comment": str, "await_comment": bool} }
 
 # ------------------------- КНОПКИ ---------------------------
@@ -681,7 +687,7 @@ async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if results.empty:
         return await q.message.reply_text("Сначала выполните поиск.")
     st["page"] += 1
-    chat_id = q.message.chat_id
+    chat_id = q.message.chat.id
     await send_page_via_bot(context.bot, chat_id, uid)
 
 # --------------------- APP / WEBHOOK ------------------------
