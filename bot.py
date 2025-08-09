@@ -7,7 +7,9 @@ import time
 import asyncio
 import logging
 from datetime import datetime
+from io import BytesIO
 
+import requests
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
@@ -45,7 +47,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DATA_TTL = 300
 PAGE_SIZE = 5
 
-# добавили новый шаг подтверждения
+# Шаги диалога (добавлен ASK_CONFIRM)
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
@@ -85,7 +87,8 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        for col in ("код", "oem"):
+        # Важно: привести 'image' к строке
+        for col in ("код", "oem", "image"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
         df = new_df
@@ -115,23 +118,45 @@ def format_row(row: dict) -> str:
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
+def normalize_drive_url(url: str) -> str:
+    m = re.search(r'drive\.google\.com/(?:file/d/([-\w]{20,})|open\?id=([-\w]{20,}))', url)
+    if m:
+        file_id = m.group(1) or m.group(2)
+        return f'https://drive.google.com/uc?export=download&id={file_id}'
+    return url
+
 def get_row_image(row: dict) -> str:
-    for key in ("image", "изображение", "photo", "фото"):
-        url = row.get(key)
-        if isinstance(url, str) and url.strip():
-            return url.strip()
+    # Ищем колонку картинки. Ты используешь 'image' — это покроется.
+    for k, v in row.items():
+        key = str(k).strip().lower()
+        if any(tok in key for tok in ("image", "img", "photo", "фото", "изобр", "картин", "url")):
+            if isinstance(v, str) and v.strip():
+                return normalize_drive_url(v.strip())
     return ""
 
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
-    img = get_row_image(row)
-    if img:
+
+    url = get_row_image(row)
+    if url:
+        # 1) пробуем по URL
         try:
-            await update.message.reply_photo(photo=img, caption=text, reply_markup=kb)
+            await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
-            logger.warning(f"Не удалось отправить фото: {e}")
+            logger.warning(f"URL фото не сработал ({url}): {e}")
+            # 2) качаем и шлём байтами
+            try:
+                r = requests.get(url, timeout=15)
+                r.raise_for_status()
+                bio = BytesIO(r.content)
+                bio.name = "image.jpg"
+                await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
+                return
+            except Exception as e2:
+                logger.warning(f"Скачивание фото тоже не удалось: {e2}")
+
     await update.message.reply_text(text, reply_markup=kb)
 
 def get_user_state(user_id: int) -> dict:
@@ -226,7 +251,9 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv"))
 
 # ------------------------- ПОИСК -----------------------------
-SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
+# ДОБАВИЛИ image В ПОЛЯ ДЛЯ ПОИСКА
+SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель", "image"]
+
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
 
@@ -235,6 +262,7 @@ def match_row(row: dict, tokens: list[str]) -> int:
     for f in SEARCH_FIELDS:
         val = normalize(str(row.get(f, "")))
         if val and all(t in val for t in tokens):
+            # коду и oem дадим больший вес; image — обычный
             score += 2 if f in ("код", "oem") else 1
     return score
 
@@ -243,7 +271,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
 
-    # если прошлый хендлер пометил "не искать" — выходим тихо
+    # не подавляем поиск после отмены/«Нет»
     if context.chat_data.pop("suppress_next_search", False):
         return
 
@@ -336,7 +364,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not found:
         return await q.edit_message_text("Не удалось найти деталь по коду. Выполните поиск заново.")
 
-    issue_state[uid] = {"part": found}  # quantity/comment будут позже
+    issue_state[uid] = {"part": found}
     await q.message.reply_text("Сколько списать? Укажите число (например: 1 или 2.5).", reply_markup=cancel_markup())
     return ASK_QUANTITY
 
@@ -421,7 +449,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "confirm_no":
-        # ⚠️ Больше НЕ подавляем следующий поиск
+        # Не подавляем следующий ввод: поиск должен сработать сразу
         issue_state.pop(uid, None)
         user_state.pop(uid, None)
         await q.message.reply_text("❌ Списание отменено.")
@@ -437,7 +465,7 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
-    # ⚠️ Больше НЕ ставим suppress_next_search
+    # Не ставим suppress_next_search — чтобы поиск запускался сразу
     await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
