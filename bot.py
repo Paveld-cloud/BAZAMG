@@ -205,7 +205,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if issue_state.pop(uid, None):
         user_state.pop(uid, None)
-        await update.message.reply_text("❌ Операция списания отменена.")
+        await update.message.reply_text("❌ Операция списания отменена.Нажмите /start для нового поиска")
     else:
         await update.message.reply_text("Нет активной операции.")
 
