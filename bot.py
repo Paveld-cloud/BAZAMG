@@ -2,41 +2,40 @@ import logging
 import os
 import json
 import re
-from datetime import datetime
+import io
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
 )
+import pandas as pd
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния диалога списания
+# Константы этапов
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
-
-# Глобальные состояния
-user_state = {}
-issue_state = {}  # {user_id: {"part": ..., "quantity": ..., "comment": ...}}
 
 # Переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TIMEZONE = ZoneInfo("Asia/Tashkent")
+DATA_TTL = 300  # кэш 5 минут
+
+# Кэш данных
+DATA_CACHE = {"data": None, "timestamp": None}
+
+# Состояния списания {user_id: {...}}
+user_state = {}
+suppress_next_search = set()
 
 # Авторизация Google Sheets
 def get_gs_client():
@@ -44,137 +43,159 @@ def get_gs_client():
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-# Загрузка данных
-def load_data():
+# Загрузка данных с кэшированием
+def load_data(force=False):
+    now = datetime.now()
+    if not force and DATA_CACHE["data"] and DATA_CACHE["timestamp"] and (now - DATA_CACHE["timestamp"]).total_seconds() < DATA_TTL:
+        return DATA_CACHE["data"]
+
     client = get_gs_client()
     sheet = client.open_by_url(SPREADSHEET_URL).worksheet("SAP")
-    return sheet.get_all_records()
+    data = sheet.get_all_records()
+    DATA_CACHE["data"] = data
+    DATA_CACHE["timestamp"] = now
+    logger.info(f"✅ Загружено {len(data)} строк из Google Sheet")
+    return data
 
-DATA_CACHE = load_data()
-logger.info(f"✅ Загружено {len(DATA_CACHE)} строк из Google Sheet")
-
-# ====== Поиск ======
+# Поиск деталей
 def search_parts(query):
-    pattern = re.compile(re.escape(query), re.IGNORECASE)
-    return [row for row in DATA_CACHE if any(pattern.search(str(v)) for v in row.values())]
+    query = query.strip().lower()
+    if not query:
+        return []
+    data = load_data()
+    results = []
+    for row in data:
+        text = " ".join([str(row.get(k, "")).lower() for k in ["тип", "наименование", "код", "oem", "изготовитель"]])
+        if query in text:
+            results.append(row)
+    return results
 
-# ====== Команды ======
+# Команда /start
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Введите название детали для поиска")
+    await update.message.reply_text("🔍 Отправьте запрос для поиска детали.\nДля экспорта используйте /export.")
 
+# Экспорт в Excel
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    df = pd.DataFrame(data)
+    bio = io.BytesIO()
+    bio.name = "data.xlsx"
+    df.to_excel(bio, index=False)
+    bio.seek(0)
+    await update.message.reply_document(InputFile(bio, filename="data.xlsx"))
+
+# Обработка поиска
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in suppress_next_search:
+        suppress_next_search.remove(user_id)
+        return
+
     query = update.message.text.strip()
     results = search_parts(query)
 
     if not results:
-        await update.message.reply_text("❌ Ничего не найдено")
+        await update.message.reply_text("❌ Ничего не найдено.")
         return
 
-    for item in results[:10]:  # Ограничим вывод
-        text = f"📦 {item.get('PartName')}\nКод: {item.get('PartCode')}"
-        keyboard = [[InlineKeyboardButton("📤 Взять деталь", callback_data=f"take|{item.get('PartName')}")]]
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    for part in results[:10]:
+        caption = f"📦 *{part.get('наименование','')}*\nКод: `{part.get('код','')}`\nOEM: {part.get('oem','')}"
+        keyboard = [[InlineKeyboardButton("📥 Взять деталь", callback_data=f"take|{part.get('код')}")]]
+        await update.message.reply_text(
+            caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
 
-# ====== Списание ======
+# Обработка кнопки "Взять деталь"
 async def take_part_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    _, part_name = query.data.split("|", 1)
-    user_state[query.from_user.id] = {"part": part_name}
-
-    await query.message.reply_text(f"Введите количество для списания ({part_name}):")
+    part_code = query.data.split("|")[1]
+    user_state[query.from_user.id] = {"part_code": part_code}
+    suppress_next_search.add(query.from_user.id)
+    await query.message.reply_text("Введите количество:")
     return ASK_QUANTITY
 
-async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    qty = update.message.text.strip()
-    if not qty.isdigit():
-        await update.message.reply_text("Введите число!")
+# Ввод количества
+async def quantity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        qty = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Введите число.")
         return ASK_QUANTITY
-
-    user_state[update.message.from_user.id]["quantity"] = qty
+    user_state[update.effective_user.id]["quantity"] = qty
+    suppress_next_search.add(update.effective_user.id)
     await update.message.reply_text("Введите комментарий:")
     return ASK_COMMENT
 
-async def confirm_writeoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Ввод комментария и подтверждение
+async def comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     comment = update.message.text.strip()
-    user_id = update.message.from_user.id
-
-    user_state[user_id]["comment"] = comment
-
-    part = user_state[user_id]["part"]
-    qty = user_state[user_id]["quantity"]
+    st = user_state[update.effective_user.id]
+    st["comment"] = comment
 
     # Кнопки подтверждения
     keyboard = [
-        [
-            InlineKeyboardButton("✅ Да", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ Нет", callback_data="confirm_no"),
-        ]
+        [InlineKeyboardButton("✅ Да", callback_data="confirm_yes"),
+         InlineKeyboardButton("❌ Нет", callback_data="confirm_no")]
     ]
-    await update.message.reply_text(
-        f"Вы уверены, что хотите списать:\n\n📦 {part}\nКоличество: {qty}\nКомментарий: {comment}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    text = (f"Вы уверены, что хотите списать деталь?\n\n"
+            f"📦 Код: {st['part_code']}\n"
+            f"🔢 Кол-во: {st['quantity']}\n"
+            f"💬 Комментарий: {st['comment']}")
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return ASK_CONFIRM
 
-async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработка подтверждения
+async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-
+    uid = query.from_user.id
     if query.data == "confirm_yes":
-        # Запись в Google Sheets
-        client = get_gs_client()
-        sheet = client.open_by_url(SPREADSHEET_URL).worksheet("История")
-        now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-
-        sheet.append_row([
-            str(user_id),
-            query.from_user.first_name,
-            user_state[user_id]["part"],
-            user_state[user_id]["quantity"],
-            user_state[user_id]["comment"],
-            now
-        ])
-        await query.message.reply_text("✅ Деталь успешно списана")
+        st = user_state.pop(uid, None)
+        if st:
+            client = get_gs_client()
+            ws = client.open_by_url(SPREADSHEET_URL).worksheet("История")
+            ws.append_row([
+                datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d %H:%M:%S"),
+                query.from_user.username or "",
+                st["part_code"], st["quantity"], st["comment"]
+            ])
+            await query.message.reply_text("✅ Деталь списана и записана в историю.")
     else:
-        await query.message.reply_text("❌ Списание отменено")
-
-    user_state.pop(user_id, None)
+        user_state.pop(uid, None)
+        await query.message.reply_text("❌ Списание отменено.")
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_state.pop(update.message.from_user.id, None)
-    await update.message.reply_text("❌ Действие отменено")
+# Отмена
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state.pop(update.effective_user.id, None)
+    await update.message.reply_text("❌ Действие отменено.")
     return ConversationHandler.END
 
-# ====== Построение приложения ======
+# Построение приложения
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(take_part_callback, pattern="^take\\|")],
+        entry_points=[CallbackQueryHandler(take_part_callback, pattern=r"^take\|")],
         states={
-            ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_comment)],
-            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_writeoff)],
-            ASK_CONFIRM: [CallbackQueryHandler(confirm_callback, pattern="^confirm_")],
+            ASK_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, quantity_handler)],
+            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment_handler)],
+            ASK_CONFIRM: [CallbackQueryHandler(confirm_handler, pattern=r"^confirm_")]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        map_to_parent={ConversationHandler.END: ConversationHandler.END},
+        fallbacks=[
+            CommandHandler("cancel", cancel_cmd),
+            MessageHandler(filters.Regex("^Отменить$"), cancel_cmd)
+        ],
     )
-
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler))
+    app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(conv)
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler))
     return app
 
 if __name__ == "__main__":
-    application = build_app()
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 8080)),
-        url_path="webhook",
-        webhook_url=f"{os.getenv('WEBHOOK_URL')}/webhook"
-    )
+    app = build_app()
+    PORT = int(os.environ.get("PORT", "8080"))
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    app.run_webhook(listen="0.0.0.0", port=PORT, url_path="", webhook_url=WEBHOOK_URL)
