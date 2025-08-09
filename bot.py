@@ -205,7 +205,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /help — помощь\n"
         "• /more — показать ещё\n"
         "• /export — выгрузка результатов (XLSX/CSV)\n"
-        "• /cancel — отменить списание\n"
+        "• /cancel — отменить списание (или кнопкой «Отменить» в диалоге)\n"
         "• /reload — перезагрузить данные (только админ)",
         parse_mode="Markdown"
     )
@@ -218,7 +218,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "• /more — следующая страница\n"
         "• /export — экспорт результатов\n"
-        "• /cancel — отмена списания\n"
+        "• /cancel — отмена (есть кнопка «Отменить»)\n"
         "• /reload — перезагрузка данных (админ)"
     )
 
@@ -232,9 +232,31 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel на всякий — оставим тоже."""
     user_id = update.effective_user.id
     if issue_state.pop(user_id, None):
-        await update.message.reply_text("Операция списания отменена.")
+        user_state.pop(user_id, None)
+        await update.message.reply_text("❌ Операция списания отменена.")
     else:
         await update.message.reply_text("Нет активной операции для отмены.")
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспорт результатов последнего поиска: сначала XLSX, если не выйдет — CSV."""
+    user_id = update.effective_user.id
+    state = get_user_state(user_id)
+    results: DataFrame = state.get("results") or DataFrame()
+    if results.empty:
+        return await update.message.reply_text("Сначала выполните поиск, чтобы было что экспортировать.")
+
+    try:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            results.to_excel(writer, index=False)
+        output.seek(0)
+        await update.message.reply_document(InputFile(output, filename=f"export_{user_id}.xlsx"))
+    except Exception as e:
+        logger.warning(f"XLSX не удалось, отправляем CSV: {e}")
+        csv_data = results.to_csv(index=False, encoding="utf-8-sig")
+        await update.message.reply_document(
+            InputFile(io.BytesIO(csv_data.encode("utf-8-sig")), filename=f"export_{user_id}.csv")
+        )
 
 # ===================== ПОИСК (с гейтом) =====================
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,9 +274,15 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = issue_state.get(user_id)
     if st:
         if "quantity" not in st:
-            return await update.message.reply_text("Вы сейчас вводите количество для списания. Введите число или нажмите «Отменить».", reply_markup=cancel_markup())
+            return await update.message.reply_text(
+                "Вы сейчас вводите количество для списания. Введите число или нажмите «Отменить».",
+                reply_markup=cancel_markup()
+            )
         if st.get("await_comment"):
-            return await update.message.reply_text("Вы сейчас вводите комментарий для списания. Напишите текст или «-», либо нажмите «Отменить».", reply_markup=cancel_markup())
+            return await update.message.reply_text(
+                "Вы сейчас вводите комментарий для списания. Напишите текст или «-», либо нажмите «Отменить».",
+                reply_markup=cancel_markup()
+            )
 
     query = update.message.text.strip()
     if not query:
