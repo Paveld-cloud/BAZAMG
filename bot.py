@@ -47,7 +47,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DATA_TTL = 300
 PAGE_SIZE = 5
 
-# шаги диалога: добавлен ASK_CONFIRM
+# шаги диалога
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
@@ -87,7 +87,7 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        # приводим к строке и нижнему регистру код/оем; image НЕ трогаем регистр
+        # код/оем в нижний регистр; image НЕ трогаем регистр, чтобы не ломать URL
         for col in ("код", "oem"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
@@ -120,6 +120,7 @@ def format_row(row: dict) -> str:
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
+# ---------- Работа со ссылками на изображения ----------
 def normalize_drive_url(url: str) -> str:
     m = re.search(r'drive\.google\.com/(?:file/d/([-\w]{20,})|open\?id=([-\w]{20,}))', url)
     if m:
@@ -141,7 +142,7 @@ def resolve_ibb_direct(url: str) -> str:
     return url
 
 def resolve_image_url(url: str) -> str:
-    u = url.strip()
+    u = (url or "").strip()
     if not u:
         return u
     if "drive.google.com" in u:
@@ -150,21 +151,38 @@ def resolve_image_url(url: str) -> str:
         return resolve_ibb_direct(u)
     return u
 
-def get_row_image(row: dict) -> str:
-    # ищем поле с картинкой
-    for k, v in row.items():
-        key = str(k).strip().lower()
-        if any(tok in key for tok in ("image", "img", "photo", "фото", "изобр", "картин", "url")):
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+def find_image_by_code(code: str) -> str:
+    """
+    Ищем картинку по КОДУ детали в СТОЛБЦЕ image (URL содержит код).
+    1) Сначала пробуем строку с тем же кодом и непустым image.
+    2) Потом ищем любую строку, где image содержит этот код (case-insensitive).
+    """
+    if df is None or "image" not in df.columns:
+        return ""
+    code_l = str(code or "").strip().lower()
+    if not code_l:
+        return ""
+
+    # 1) прямое совпадение кода в той же строке
+    if "код" in df.columns:
+        own = df[(df["код"].astype(str).str.lower() == code_l) & (df["image"].astype(str).str.len() > 0)]
+        if not own.empty:
+            return resolve_image_url(str(own.iloc[0]["image"]))
+
+    # 2) поиск в любом URL по подстроке кода
+    mask = df["image"].astype(str).str.contains(re.escape(code_l), case=False, na=False)
+    if mask.any():
+        url = str(df.loc[mask, "image"].iloc[0])
+        return resolve_image_url(url)
+
     return ""
 
 async def send_row_with_image(update: Update, row: dict, text: str):
-    code = str(row.get("код", "")).strip().lower()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
+    code = str(row.get("код", "")).strip()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
 
-    raw_url = get_row_image(row)
-    url = resolve_image_url(raw_url) if raw_url else ""
+    # Картинку берём по коду из КОЛОНКИ image (см. логику выше)
+    url = find_image_by_code(code)
 
     if url:
         # 1) пробуем отдать как URL
@@ -232,7 +250,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `фильтр масла` или `96353000`).\n"
+        "Привет! Напиши запрос (например: `фильтр масла` или `UZ000830`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
@@ -244,10 +262,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "1) Введите слова для поиска (можно несколько).\n"
+        "1) Выполните поиск по названию/модели/коду.\n"
         "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий, "
         "а затем попросит подтвердить списание (Да/Нет).\n"
-        "Команды: /more, /export, /cancel, /reload (для админа)."
+        "Фото подставляется по КОДУ из столбца image, где URL содержит этот код."
     )
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,8 +300,8 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv"))
 
 # ------------------------- ПОИСК -----------------------------
-# теперь ищем и в колонке image
-SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель", "image"]
+# ВАЖНО: image здесь НЕТ — поиск по image не делаем
+SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
 
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
@@ -301,7 +319,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
 
-    # не подавляем поиск после отмены/«Нет»
     if context.chat_data.pop("suppress_next_search", False):
         return
 
@@ -399,7 +416,6 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -421,7 +437,6 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -436,7 +451,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         issue_state.pop(uid, None)
         return await update.message.reply_text("Что-то пошло не так. Попробуйте ещё раз.")
 
-    # сохраняем комментарий и показываем подтверждение
     st["comment"] = "" if comment == "-" else comment
     st["await_comment"] = False
 
@@ -494,7 +508,6 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
-    # без подавления поиска
     await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
