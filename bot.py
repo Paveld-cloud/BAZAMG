@@ -87,7 +87,7 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        # код/оем в нижний регистр; image НЕ трогаем регистр, чтобы не ломать URL
+        # код/оем в нижний регистр; image НЕ трогаем регистр (может быть важен)
         for col in ("код", "oem"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
@@ -153,26 +153,30 @@ def resolve_image_url(url: str) -> str:
 
 def find_image_by_code(code: str) -> str:
     """
-    Ищем картинку по КОДУ детали в СТОЛБЦЕ image (URL содержит код).
-    1) Сначала пробуем строку с тем же кодом и непустым image.
-    2) Потом ищем любую строку, где image содержит этот код (case-insensitive).
+    Ищем ссылку на фото по КОДУ в столбце image (по всему листу).
+    1) Сначала точнее: код как отдельный токен в URL (/, _, -, или расширение .png/.jpg и т.п.).
+    2) Если не нашли — простое contains (case-insensitive).
+    Возвращаем нормализованный URL (i.ibb.co / Google Drive direct и т.д.).
     """
     if df is None or "image" not in df.columns:
         return ""
-    code_l = str(code or "").strip().lower()
-    if not code_l:
+    code_raw = (code or "").strip()
+    if not code_raw:
         return ""
 
-    # 1) прямое совпадение кода в той же строке
-    if "код" in df.columns:
-        own = df[(df["код"].astype(str).str.lower() == code_l) & (df["image"].astype(str).str.len() > 0)]
-        if not own.empty:
-            return resolve_image_url(str(own.iloc[0]["image"]))
+    col = df["image"].astype(str)
 
-    # 2) поиск в любом URL по подстроке кода
-    mask = df["image"].astype(str).str.contains(re.escape(code_l), case=False, na=False)
-    if mask.any():
-        url = str(df.loc[mask, "image"].iloc[0])
+    # 1) Точное-ish совпадение кода как токена в URL/пути
+    pat = r'(?i)(?:^|[\/_\-])' + re.escape(code_raw) + r'(?:\.[a-z0-9]{2,5}(?:\?.*)?$|[\/_\-?#])'
+    mask_token = col.str.contains(pat, regex=True, na=False)
+    if mask_token.any():
+        url = str(col[mask_token].iloc[0]).strip()
+        return resolve_image_url(url)
+
+    # 2) Фолбэк: простое вхождение кода
+    mask_contains = col.str.contains(re.escape(code_raw), case=False, na=False)
+    if mask_contains.any():
+        url = str(col[mask_contains].iloc[0]).strip()
         return resolve_image_url(url)
 
     return ""
@@ -181,7 +185,7 @@ async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
 
-    # Картинку берём по коду из КОЛОНКИ image (см. логику выше)
+    # Картинку берём строго по коду из КОЛОНКИ image (всей таблицы)
     url = find_image_by_code(code)
 
     if url:
@@ -265,7 +269,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1) Выполните поиск по названию/модели/коду.\n"
         "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий, "
         "а затем попросит подтвердить списание (Да/Нет).\n"
-        "Фото подставляется по КОДУ из столбца image, где URL содержит этот код."
+        "Фото ищется по *коду* детали во *всём* столбце `image` (URL содержит код).",
+        parse_mode="Markdown"
     )
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,8 +305,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv"))
 
 # ------------------------- ПОИСК -----------------------------
-# ВАЖНО: image здесь НЕТ — поиск по image не делаем
-SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
+SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]  # image НЕ ищем
 
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
@@ -332,7 +336,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         if st_issue.get("await_comment"):
             return await update.message.reply_text(
-                "Вы вводите комментарий. Напишите текст или «-», либо нажмите «Отменить».",
+                "Вы вводите комментарий. Напишите Название Линии и Номер операции».",
                 reply_markup=cancel_markup()
             )
 
