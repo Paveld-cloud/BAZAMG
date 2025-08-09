@@ -8,6 +8,7 @@ import asyncio
 import logging
 from datetime import datetime
 from io import BytesIO
+from zoneinfo import ZoneInfo  # локальное время для Истории
 
 import requests
 import gspread
@@ -37,6 +38,14 @@ WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
+
+# Часовой пояс для записи в Историю
+TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    try:
+        return datetime.now(ZoneInfo(TZ_NAME)).strftime(fmt)
+    except Exception:
+        return datetime.utcnow().strftime(fmt)
 
 if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON or not WEBHOOK_URL:
     raise RuntimeError(
@@ -173,7 +182,6 @@ def find_image_by_code(code: str) -> str:
     Ищем ссылку на фото по КОДУ в столбце image (по всему листу).
     1) Точнее: код как токен в URL/имени файла (/, _, -, или расширение .png/.jpg и т.п.).
     2) Если не нашли — простой contains (case-insensitive).
-    Возвращаем нормализованный URL (i.ibb.co / Google Drive direct и т.д.).
     """
     if df is None or "image" not in df.columns:
         return ""
@@ -381,7 +389,7 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
         full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
         display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = now_local_str()  # локальное время по TIMEZONE
 
         # Маппинг значений по нормализованным ключам
         values_by_key = {
@@ -406,7 +414,7 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
             "количество": str(quantity),
             "qty": str(quantity),
 
-            # Комментарий — с одной или двумя «м», плюс английский
+            # Комментарий — с одной/двумя «м», плюс английский
             "коментарий": comment or "",
             "комментарий": comment or "",
             "comment": comment or "",
@@ -462,7 +470,6 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if issue_state.pop(uid, None):
-        # user_state НЕ трогаем, чтобы /more и «Ещё» работали дальше
         await update.message.reply_text("❌ Операция списания отменена.")
     else:
         await update.message.reply_text("Нет активной операции.")
@@ -622,7 +629,6 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -640,11 +646,10 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (Наименование Линии,Номер операции).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -699,7 +704,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "confirm_no":
-        issue_state.pop(uid, None)   # user_state НЕ трогаем
+        issue_state.pop(uid, None)
         await q.message.reply_text("❌ Списание отменено.")
         return ConversationHandler.END
 
@@ -709,9 +714,8 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
 
     if uid not in issue_state:
-        return  # тихо игнорируем старые кнопки
-
-    issue_state.pop(uid, None)  # user_state НЕ трогаем
+        return
+    issue_state.pop(uid, None)
     await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
@@ -747,7 +751,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Гварды с наивысшим приоритетом (режем доступ до любых других хендлеров)
+    # Гварды до любых хендлеров
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
@@ -799,6 +803,7 @@ def build_app():
     return app
 
 if __name__ == "__main__":
+    logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
     ensure_fresh_data(force=True)
     ensure_users(force=True)
     application = build_app()
