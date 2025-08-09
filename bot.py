@@ -646,7 +646,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий Пример: (Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
