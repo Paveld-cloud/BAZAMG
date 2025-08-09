@@ -440,7 +440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `ФИЛЬТР` или по типу детали `PI8808DRG500`).\n"
+        "Привет! Напиши запрос (например:По наименованию `ПОДШЛЕМНИК` или по типу детали `PI8808DRG500`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
