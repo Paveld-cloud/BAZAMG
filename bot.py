@@ -254,7 +254,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `фильтр масла` или `UZ000830`).\n"
+        "Привет! Напиши запрос (например: `фильтр масла` или `P6SCN`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
@@ -437,7 +437,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий (Напишите Название Линии и Номер операции).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
