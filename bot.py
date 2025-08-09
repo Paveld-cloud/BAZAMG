@@ -64,7 +64,7 @@ _last_users_ts = 0.0
 user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
 issue_state: dict[int, dict] = {}  # { user_id: {"part": dict, "quantity": float, "comment": str, "await_comment": bool} }
 
-# ------------------------- УТИЛИТЫ --------------------------
+# ------------------------- КНОПКИ ---------------------------
 def cancel_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]])
 
@@ -77,6 +77,10 @@ def confirm_markup():
         [InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]
     ])
 
+def more_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
+
+# ------------------------- GOOGLE SHEETS ---------------------
 def get_gs_client():
     creds_info = json.loads(CREDS_JSON)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -85,7 +89,7 @@ def get_gs_client():
 def load_data() -> list[dict]:
     client = get_gs_client()
     sheet = client.open_by_url(SPREADSHEET_URL)
-    ws = sheet.sheet1   # если нужен конкретный лист, замени на worksheet("SAP")
+    ws = sheet.sheet1   # при необходимости замени на worksheet("SAP")
     return ws.get_all_records()
 
 def ensure_fresh_data(force: bool = False):
@@ -94,7 +98,6 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        # код/оем в нижний регистр; image НЕ трогаем регистр, чтобы не ломать URL
         for col in ("код", "oem"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
@@ -104,6 +107,7 @@ def ensure_fresh_data(force: bool = False):
         _last_load_ts = time.time()
         logger.info(f"✅ Загружено {len(df)} строк из Google Sheet")
 
+# ------------------------- УТИЛИТЫ --------------------------
 def val(row: dict, key: str, default: str = "—") -> str:
     v = row.get(key)
     if v is None:
@@ -191,18 +195,14 @@ def find_image_by_code(code: str) -> str:
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
-
-    # Картинку берём строго по коду из КОЛОНКИ image (всей таблицы)
     url = find_image_by_code(code)
 
     if url:
-        # 1) пробуем отдать как URL
         try:
             await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
             logger.warning(f"URL фото не сработал ({url}): {e}")
-            # 2) качаем и шлём как файл
             try:
                 r = requests.get(url, timeout=15, allow_redirects=True)
                 r.raise_for_status()
@@ -216,11 +216,27 @@ async def send_row_with_image(update: Update, row: dict, text: str):
             except Exception as e2:
                 logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
 
-    # 3) без фото
     await update.message.reply_text(text, reply_markup=kb)
 
-def get_user_state(user_id: int) -> dict:
-    return user_state.setdefault(user_id, {"query": "", "results": DataFrame(), "page": 0})
+async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
+    code = str(row.get("код", "")).strip()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
+    url = find_image_by_code(code)
+    if url:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
+            return
+        except Exception as e:
+            logger.warning(f"URL фото не сработал ({url}): {e}")
+            try:
+                r = requests.get(url, timeout=15, allow_redirects=True)
+                r.raise_for_status()
+                bio = BytesIO(r.content); bio.name = "image"
+                await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
+                return
+            except Exception as e2:
+                logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 # --------------------- ПОЛЬЗОВАТЕЛИ (лист «Пользователи») ----
 def _truthy(x) -> bool:
@@ -403,7 +419,7 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if issue_state.pop(uid, None):
-        user_state.pop(uid, None)
+        # user_state НЕ трогаем, чтобы /more и «Ещё» работали дальше
         await update.message.reply_text("❌ Операция списания отменена.")
     else:
         await update.message.reply_text("Нет активной операции.")
@@ -516,7 +532,25 @@ async def send_page(update: Update, uid: int):
     for _, row in chunk.iterrows():
         await send_row_with_image(update, row.to_dict(), format_row(row.to_dict()))
     if end < total:
-        await update.message.reply_text("Нажмите /more, чтобы показать ещё.")
+        await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
+
+async def send_page_via_bot(bot, chat_id: int, uid: int):
+    st = get_user_state(uid)
+    results: DataFrame = st["results"]
+    page = st["page"]
+    total = len(results)
+    pages = math.ceil(total / PAGE_SIZE)
+    if page >= pages:
+        st["page"] = pages - 1
+        return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    await bot.send_message(chat_id=chat_id, text=f"Показываю {start + 1}–{end} из {total}.")
+    chunk = results.iloc[start:end]
+    for _, row in chunk.iterrows():
+        await send_row_with_image_bot(bot, chat_id, row.to_dict(), format_row(row.to_dict()))
+    if end < total:
+        await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
 
 # ------------------ СПИСАНИЕ (Диалог) -----------------------
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,7 +634,6 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = issue_state.get(uid)
         if not st or "part" not in st or "quantity" not in st:
             issue_state.pop(uid, None)
-            user_state.pop(uid, None)
             return await q.message.reply_text("Данных для списания нет. Начните заново.")
         part = st["part"]
         qty = st["quantity"]
@@ -608,8 +641,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
 
-        issue_state.pop(uid, None)
-        user_state.pop(uid, None)
+        issue_state.pop(uid, None)   # user_state НЕ трогаем
 
         await q.message.reply_text(
             f"✅ Списано: {qty}\n"
@@ -620,8 +652,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "confirm_no":
-        issue_state.pop(uid, None)
-        user_state.pop(uid, None)
+        issue_state.pop(uid, None)   # user_state НЕ трогаем
         await q.message.reply_text("❌ Списание отменено.")
         return ConversationHandler.END
 
@@ -633,14 +664,25 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in issue_state:
         return  # тихо игнорируем старые кнопки
 
-    issue_state.pop(uid, None)
-    user_state.pop(uid, None)
+    issue_state.pop(uid, None)  # user_state НЕ трогаем
     await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cancel_cmd(update, context)
     return ConversationHandler.END
+
+async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    st = get_user_state(uid)
+    results: DataFrame = st.get("results") or DataFrame()
+    if results.empty:
+        return await q.message.reply_text("Сначала выполните поиск.")
+    st["page"] += 1
+    chat_id = q.message.chat_id
+    await send_page_via_bot(context.bot, chat_id, uid)
 
 # --------------------- APP / WEBHOOK ------------------------
 def build_app():
@@ -657,6 +699,9 @@ def build_app():
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+
+    # Кнопка «Ещё»
+    app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
 
     # Диалог списания
     conv = ConversationHandler(
