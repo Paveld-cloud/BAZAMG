@@ -177,7 +177,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `фильтр масла` или `96353000`).\n"
+        "Привет! Напиши запрос (например: `фильтр` или `911148`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
