@@ -47,7 +47,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DATA_TTL = 300
 PAGE_SIZE = 5
 
-# Шаги диалога (добавлен ASK_CONFIRM)
+# шаги диалога: добавлен ASK_CONFIRM
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
@@ -87,10 +87,12 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        # Важно: привести 'image' к строке
-        for col in ("код", "oem", "image"):
+        # приводим к строке и нижнему регистру код/оем; image НЕ трогаем регистр
+        for col in ("код", "oem"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+        if "image" in new_df.columns:
+            new_df["image"] = new_df["image"].astype(str).str.strip()
         df = new_df
         _last_load_ts = time.time()
         logger.info(f"✅ Загружено {len(df)} строк из Google Sheet")
@@ -125,38 +127,67 @@ def normalize_drive_url(url: str) -> str:
         return f'https://drive.google.com/uc?export=download&id={file_id}'
     return url
 
+def resolve_ibb_direct(url: str) -> str:
+    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...)."""
+    try:
+        resp = requests.get(url, timeout=12)
+        resp.raise_for_status()
+        html = resp.text
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        logger.warning(f"resolve_ibb_direct fail: {e}")
+    return url
+
+def resolve_image_url(url: str) -> str:
+    u = url.strip()
+    if not u:
+        return u
+    if "drive.google.com" in u:
+        return normalize_drive_url(u)
+    if re.match(r"^https?://(www\.)?ibb\.co/", u, re.I):
+        return resolve_ibb_direct(u)
+    return u
+
 def get_row_image(row: dict) -> str:
-    # Ищем колонку картинки. Ты используешь 'image' — это покроется.
+    # ищем поле с картинкой
     for k, v in row.items():
         key = str(k).strip().lower()
         if any(tok in key for tok in ("image", "img", "photo", "фото", "изобр", "картин", "url")):
             if isinstance(v, str) and v.strip():
-                return normalize_drive_url(v.strip())
+                return v.strip()
     return ""
 
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
-    url = get_row_image(row)
+    raw_url = get_row_image(row)
+    url = resolve_image_url(raw_url) if raw_url else ""
+
     if url:
-        # 1) пробуем по URL
+        # 1) пробуем отдать как URL
         try:
             await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
             logger.warning(f"URL фото не сработал ({url}): {e}")
-            # 2) качаем и шлём байтами
+            # 2) качаем и шлём как файл
             try:
-                r = requests.get(url, timeout=15)
+                r = requests.get(url, timeout=15, allow_redirects=True)
                 r.raise_for_status()
                 bio = BytesIO(r.content)
-                bio.name = "image.jpg"
+                ctype = r.headers.get("Content-Type", "").lower()
+                if "image" not in ctype:
+                    logger.warning(f"Получили non-image Content-Type ({ctype}) с {url}")
+                bio.name = "image"
                 await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
                 return
             except Exception as e2:
-                logger.warning(f"Скачивание фото тоже не удалось: {e2}")
+                logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
 
+    # 3) без фото
     await update.message.reply_text(text, reply_markup=kb)
 
 def get_user_state(user_id: int) -> dict:
@@ -251,7 +282,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv"))
 
 # ------------------------- ПОИСК -----------------------------
-# ДОБАВИЛИ image В ПОЛЯ ДЛЯ ПОИСКА
+# теперь ищем и в колонке image
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель", "image"]
 
 def normalize(text: str) -> str:
@@ -262,7 +293,6 @@ def match_row(row: dict, tokens: list[str]) -> int:
     for f in SEARCH_FIELDS:
         val = normalize(str(row.get(f, "")))
         if val and all(t in val for t in tokens):
-            # коду и oem дадим больший вес; image — обычный
             score += 2 if f in ("код", "oem") else 1
     return score
 
@@ -449,7 +479,6 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "confirm_no":
-        # Не подавляем следующий ввод: поиск должен сработать сразу
         issue_state.pop(uid, None)
         user_state.pop(uid, None)
         await q.message.reply_text("❌ Списание отменено.")
@@ -465,7 +494,7 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
-    # Не ставим suppress_next_search — чтобы поиск запускался сразу
+    # без подавления поиска
     await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
