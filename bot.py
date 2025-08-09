@@ -146,6 +146,14 @@ def format_row(row: dict) -> str:
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
+# --- нормализация для «слитного» поиска ---
+def normalize(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
+
+def squash(text: str) -> str:
+    # убираем все не-буквенно-цифровые символы и подчёркивания → "PI8808DRG500"
+    return re.sub(r"[\W_]+", "", (text or "").lower(), flags=re.UNICODE)
+
 # ---------- Работа со ссылками на изображения ----------
 def normalize_drive_url(url: str) -> str:
     m = re.search(r'drive\.google\.com/(?:file/d/([-\w]{20,})|open\?id=([-\w]{20,}))', url)
@@ -496,14 +504,20 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------- ПОИСК -----------------------------
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]  # image НЕ ищем
 
-def normalize(text: str) -> str:
-    return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
-
-def match_row(row: dict, tokens: list[str]) -> int:
+def match_row(row: dict, tokens: list[str], q_squash: str) -> int:
     score = 0
     for f in SEARCH_FIELDS:
-        val = normalize(str(row.get(f, "")))
-        if val and all(t in val for t in tokens):
+        raw = str(row.get(f, ""))
+        val_norm = normalize(raw)
+        val_squash = squash(raw)
+
+        # классический матч по токенам
+        if val_norm and all(t in val_norm for t in tokens):
+            score += 2 if f in ("код", "oem") else 1
+            continue
+
+        # слитный запрос (PI8808DRG500) против строк с пробелами/дефисами (PI 8808 DRG 500)
+        if q_squash and q_squash in val_squash:
             score += 2 if f in ("код", "oem") else 1
     return score
 
@@ -535,11 +549,12 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tokens = normalize(q).split()
     if not tokens:
         return await update.message.reply_text("Введите более конкретный запрос.")
+    q_squash = squash(q)  # НОВОЕ: слитная версия запроса
 
     matches = []
     for _, row in df.iterrows():
         rd = row.to_dict()
-        s = match_row(rd, tokens)
+        s = match_row(rd, tokens, q_squash)  # передаём q_squash
         if s > 0:
             matches.append((s, rd))
 
