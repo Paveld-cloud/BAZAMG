@@ -19,7 +19,7 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, ContextTypes, filters
+    ConversationHandler, ContextTypes, filters, ApplicationHandlerStop
 )
 
 # --------------------------- ЛОГИ ---------------------------
@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bot")
 
 # -------------------------- НАСТРОЙКИ -----------------------
-ADMINS = {225177765}  # поменяй при необходимости
+ADMINS = {225177765}  # локальные админы (добавка к листу)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
@@ -44,7 +44,8 @@ if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON or not WEBHOOK_UR
     )
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DATA_TTL = 300
+DATA_TTL = 300          # TTL для данных
+USERS_TTL = 300         # TTL для листа «Пользователи»
 PAGE_SIZE = 5
 
 # шаги диалога
@@ -53,6 +54,12 @@ ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
 df: DataFrame | None = None
 _last_load_ts = 0.0
+
+# пользователи из листа
+SHEET_ALLOWED: set[int] = set()
+SHEET_ADMINS: set[int] = set()
+SHEET_BLOCKED: set[int] = set()
+_last_users_ts = 0.0
 
 user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
 issue_state: dict[int, dict] = {}  # { user_id: {"part": dict, "quantity": float, "comment": str, "await_comment": bool} }
@@ -87,7 +94,7 @@ def ensure_fresh_data(force: bool = False):
         data = load_data()
         new_df = DataFrame(data)
         new_df.columns = new_df.columns.str.strip().str.lower()
-        # код/оем в нижний регистр; image НЕ трогаем регистр (может быть важен)
+        # код/оем в нижний регистр; image НЕ трогаем регистр, чтобы не ломать URL
         for col in ("код", "oem"):
             if col in new_df.columns:
                 new_df[col] = new_df[col].astype(str).str.strip().str.lower()
@@ -154,8 +161,8 @@ def resolve_image_url(url: str) -> str:
 def find_image_by_code(code: str) -> str:
     """
     Ищем ссылку на фото по КОДУ в столбце image (по всему листу).
-    1) Сначала точнее: код как отдельный токен в URL (/, _, -, или расширение .png/.jpg и т.п.).
-    2) Если не нашли — простое contains (case-insensitive).
+    1) Точнее: код как токен в URL/имени файла (/, _, -, или расширение .png/.jpg и т.п.).
+    2) Если не нашли — простой contains (case-insensitive).
     Возвращаем нормализованный URL (i.ibb.co / Google Drive direct и т.д.).
     """
     if df is None or "image" not in df.columns:
@@ -166,7 +173,7 @@ def find_image_by_code(code: str) -> str:
 
     col = df["image"].astype(str)
 
-    # 1) Точное-ish совпадение кода как токена в URL/пути
+    # 1) «почти точное» совпадение кода как токена
     pat = r'(?i)(?:^|[\/_\-])' + re.escape(code_raw) + r'(?:\.[a-z0-9]{2,5}(?:\?.*)?$|[\/_\-?#])'
     mask_token = col.str.contains(pat, regex=True, na=False)
     if mask_token.any():
@@ -215,6 +222,118 @@ async def send_row_with_image(update: Update, row: dict, text: str):
 def get_user_state(user_id: int) -> dict:
     return user_state.setdefault(user_id, {"query": "", "results": DataFrame(), "page": 0})
 
+# --------------------- ПОЛЬЗОВАТЕЛИ (лист «Пользователи») ----
+def _truthy(x) -> bool:
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок", "allowed", "разрешен", "разрешено"} or (s.isdigit() and int(s) > 0)
+
+def _to_int_or_none(x):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        return int(m.group(0)) if m else None
+    except Exception:
+        return None
+
+def load_users_from_sheet():
+    """Читает лист 'Пользователи' (или 'Users') и возвращает три сета: allowed, admins, blocked."""
+    client = get_gs_client()
+    sh = client.open_by_url(SPREADSHEET_URL)
+    try:
+        ws = sh.worksheet("Пользователи")
+    except gspread.WorksheetNotFound:
+        try:
+            ws = sh.worksheet("Users")
+        except gspread.WorksheetNotFound:
+            logger.info("Лист 'Пользователи' не найден — ограничение по юзерам отключено (разрешаем всем).")
+            return set(), set(), set()
+
+    rows = ws.get_all_records()
+    if not rows:
+        logger.info("Лист 'Пользователи' пуст — ограничение по юзерам отключено (разрешаем всем).")
+        return set(), set(), set()
+
+    allowed, admins, blocked = set(), set(), set()
+
+    for row in rows:
+        r = {str(k).strip().lower(): v for k, v in row.items()}
+        uid = (
+            _to_int_or_none(r.get("user_id"))
+            or _to_int_or_none(r.get("userid"))
+            or _to_int_or_none(r.get("id"))
+            or _to_int_or_none(r.get("uid"))
+            or _to_int_or_none(r.get("телеграм id"))
+            or _to_int_or_none(r.get("пользователь"))
+        )
+        if not uid:
+            continue
+
+        role = str(r.get("role") or r.get("роль") or "").strip().lower()
+        is_admin_flag = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
+        is_allowed_flag = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
+        is_blocked_flag = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
+
+        if is_blocked_flag:
+            blocked.add(uid)
+        if is_admin_flag:
+            admins.add(uid)
+            is_allowed_flag = True  # админ всегда разрешён
+        if is_allowed_flag:
+            allowed.add(uid)
+
+    return allowed, admins, blocked
+
+def ensure_users(force: bool = False):
+    """Кэшируем список пользователей из листа 'Пользователи' с TTL."""
+    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
+    if force or (time.time() - _last_users_ts > USERS_TTL):
+        SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = load_users_from_sheet()
+        _last_users_ts = time.time()
+        logger.info(
+            f"👥 Пользователи: allowed={len(SHEET_ALLOWED)}, admins={len(SHEET_ADMINS)}, blocked={len(SHEET_BLOCKED)}"
+        )
+
+def is_admin(uid: int) -> bool:
+    ensure_users()
+    return uid in SHEET_ADMINS or uid in ADMINS
+
+def is_allowed(uid: int) -> bool:
+    """
+    Логика:
+    - если лист пуст/нет — разрешаем всем (как сейчас);
+    - если есть allowed — whitelist: только allowed или админ;
+    - blocked всегда запрещён.
+    """
+    ensure_users()
+    if uid in SHEET_BLOCKED:
+        return False
+    if SHEET_ALLOWED:
+        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
+    return True
+
+# --------------------- ГВАРДЫ ДО ВСЕГО -----------------------
+async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and not is_allowed(user.id):
+        try:
+            await update.effective_message.reply_text("Доступ запрещён.")
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and not is_allowed(user.id):
+        try:
+            await update.callback_query.answer("Доступ запрещён.", show_alert=True)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
 # --------------------- СОХРАНЕНИЕ СПИСАНИЙ -------------------
 def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     try:
@@ -242,7 +361,7 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     except Exception as e:
         logger.error(f"Ошибка записи списания: {e}")
         async def notify():
-            for admin_id in ADMINS:
+            for admin_id in (SHEET_ADMINS | ADMINS):
                 try:
                     await bot.send_message(admin_id, f"⚠️ Ошибка сохранения списания: {e}")
                 except Exception:
@@ -254,13 +373,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `фильтр масла` или `P6SCN`).\n"
+        "Привет! Напиши запрос (например: `фильтр масла` или `UZ000830`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
         "• /export — выгрузка результатов (XLSX/CSV)\n"
         "• /cancel — отменить списание (или кнопкой «Отменить»)\n"
-        "• /reload — перезагрузить данные (только админ)",
+        "• /reload — перезагрузить данные и пользователей (только админ)",
         parse_mode="Markdown"
     )
 
@@ -274,10 +393,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return await update.message.reply_text("Доступ запрещён.")
     ensure_fresh_data(force=True)
-    await update.message.reply_text("✅ Данные перезагружены.")
+    ensure_users(force=True)
+    await update.message.reply_text("✅ Данные и пользователи перезагружены.")
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -336,7 +457,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         if st_issue.get("await_comment"):
             return await update.message.reply_text(
-                "Вы вводите комментарий. Напишите Название Линии и Номер операции».",
+                "Вы вводите комментарий. Напишите текст или «-», либо нажмите «Отменить».",
                 reply_markup=cancel_markup()
             )
 
@@ -420,6 +541,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -437,10 +559,11 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (Напишите Название Линии и Номер операции).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # подавим поиск для этого апдейта
     context.chat_data["suppress_next_search"] = True
 
     uid = update.effective_user.id
@@ -523,6 +646,11 @@ async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # Гварды с наивысшим приоритетом (режем доступ до любых других хендлеров)
+    app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
+    app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
+
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("more", more_cmd))
@@ -530,6 +658,7 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
+    # Диалог списания
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(on_issue_click, pattern=r"^issue:"),
@@ -557,13 +686,14 @@ def build_app():
     )
     app.add_handler(conv)
 
-    # поиск — в группе 1, чтобы диалог «съедал» апдейты первым
+    # Поиск — в группе 1, чтобы диалог «съедал» апдейты первым
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
 
     return app
 
 if __name__ == "__main__":
     ensure_fresh_data(force=True)
+    ensure_users(force=True)
     application = build_app()
 
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
