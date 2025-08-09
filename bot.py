@@ -53,7 +53,6 @@ df: DataFrame | None = None
 _last_load_ts = 0.0
 
 user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
-# добавили хранение comment и флагов
 issue_state: dict[int, dict] = {}  # { user_id: {"part": dict, "quantity": float, "comment": str, "await_comment": bool} }
 
 # ------------------------- УТИЛИТЫ --------------------------
@@ -177,7 +176,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например: `фильтр` или `911148`).\n"
+        "Привет! Напиши запрос (например: `фильтр масла` или `96353000`).\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
@@ -205,7 +204,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if issue_state.pop(uid, None):
         user_state.pop(uid, None)
-        await update.message.reply_text("❌ Операция списания отменена.Нажмите /start для нового поиска")
+        await update.message.reply_text("❌ Операция списания отменена.")
     else:
         await update.message.reply_text("Нет активной операции.")
 
@@ -360,7 +359,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (Линия,Номер операции).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий (или напишите «-», если без комментария).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -379,7 +378,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         issue_state.pop(uid, None)
         return await update.message.reply_text("Что-то пошло не так. Попробуйте ещё раз.")
 
-    # сохраняем комментарий и показываем подтверждение (Новая логика)
+    # сохраняем комментарий и показываем подтверждение
     st["comment"] = "" if comment == "-" else comment
     st["await_comment"] = False
 
@@ -401,7 +400,6 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "confirm_yes":
         st = issue_state.get(uid)
         if not st or "part" not in st or "quantity" not in st:
-            # нет актуальных данных — безопасно выйти
             issue_state.pop(uid, None)
             user_state.pop(uid, None)
             return await q.message.reply_text("Данных для списания нет. Начните заново.")
@@ -409,10 +407,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty = st["quantity"]
         comment = st.get("comment", "")
 
-        # запись в Историю — только при Да
         save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
 
-        # очистка
         issue_state.pop(uid, None)
         user_state.pop(uid, None)
 
@@ -425,10 +421,9 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "confirm_no":
-        # отмена по Нет — без записи
+        # ⚠️ Больше НЕ подавляем следующий поиск
         issue_state.pop(uid, None)
         user_state.pop(uid, None)
-        context.chat_data["suppress_next_search"] = True
         await q.message.reply_text("❌ Списание отменено.")
         return ConversationHandler.END
 
@@ -442,8 +437,8 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
-    context.chat_data["suppress_next_search"] = True
-    await q.message.reply_text("❌ Операция списания отменена.Нажмите /start для нового поиска")
+    # ⚠️ Больше НЕ ставим suppress_next_search
+    await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,7 +470,6 @@ def build_app():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment),
                 CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
             ],
-            # новый шаг подтверждения
             ASK_CONFIRM: [
                 CallbackQueryHandler(handle_confirm, pattern=r"^confirm_(yes|no)$"),
                 CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
