@@ -433,7 +433,9 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st = get_user_state(uid)
-    results: DataFrame = st.get("results") or DataFrame()
+    results = st.get("results")
+    if not isinstance(results, DataFrame):
+        results = DataFrame()
     if results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
     try:
@@ -513,7 +515,9 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st = get_user_state(uid)
-    results: DataFrame = st.get("results") or DataFrame()
+    results = st.get("results")
+    if not isinstance(results, DataFrame):
+        results = DataFrame()
     if results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
     st["page"] += 1
@@ -683,12 +687,24 @@ async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     st = get_user_state(uid)
-    results: DataFrame = st.get("results") or DataFrame()
+    results = st.get("results")
+    if not isinstance(results, DataFrame):
+        results = DataFrame()
     if results.empty:
         return await q.message.reply_text("Сначала выполните поиск.")
     st["page"] += 1
     chat_id = q.message.chat.id
     await send_page_via_bot(context.bot, chat_id, uid)
+
+# --------------------- ERROR HANDLER -------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error: %s", context.error)
+    msg = f"❌ Ошибка: {context.error}"
+    for admin_id in (SHEET_ADMINS | ADMINS):
+        try:
+            await context.bot.send_message(admin_id, msg)
+        except Exception:
+            pass
 
 # --------------------- APP / WEBHOOK ------------------------
 def build_app():
@@ -739,6 +755,9 @@ def build_app():
 
     # Поиск — в группе 1, чтобы диалог «съедал» апдейты первым
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
+
+    # Error handler
+    app.add_error_handler(on_error)
 
     return app
 
