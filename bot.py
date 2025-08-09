@@ -443,7 +443,7 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
     context.chat_data["suppress_next_search"] = True
-    await q.message.reply_text("❌ Операция списания отменена.")
+    await q.message.reply_text("❌ Операция списания отменена.Нажмите /start для нового поиска")
     return ConversationHandler.END
 
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
