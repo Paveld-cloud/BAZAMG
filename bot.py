@@ -358,6 +358,11 @@ async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- СОХРАНЕНИЕ СПИСАНИЙ -------------------
 def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
+    """
+    Пишем в лист 'История' строго по его текущим заголовкам.
+    Поддерживаем разные названия и порядок колонок.
+    Ожидаемые ключи: Дата|ID|Имя|Тип|Наименование|Код|Количество|Коментарий/Комментарий/Comment
+    """
     try:
         client = get_gs_client()
         sh = client.open_by_url(SPREADSHEET_URL)
@@ -365,21 +370,53 @@ def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
             ws = sh.worksheet("История")
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title="История", rows=1000, cols=12)
-            ws.append_row([
-                "timestamp", "user_id", "username", "name",
-                "код", "наименование", "количество(списано)", "комментарий"
-            ])
-        ws.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            user.id,
-            user.username or "",
-            f"{user.first_name or ''} {user.last_name or ''}".strip(),
-            str(part.get("код", "")),
-            str(part.get("наименование", "")),
-            str(quantity),
-            comment or "",
-        ])
-        logger.info("💾 Списание записано в 'История'")
+            ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
+
+        # Заголовки листа (как есть)
+        headers_raw = ws.row_values(1)
+        headers = [h.strip() for h in headers_raw]
+        norm = [h.lower() for h in headers]
+
+        # Имя для печати
+        full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
+        display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Маппинг значений по нормализованным ключам
+        values_by_key = {
+            "дата": ts,
+            "timestamp": ts,
+
+            "id": user.id,
+            "user_id": user.id,
+
+            "имя": display_name,
+            "name": display_name,
+
+            "тип": str(part.get("тип", "")),
+            "type": str(part.get("тип", "")),
+
+            "наименование": str(part.get("наименование", "")),
+            "name_item": str(part.get("наименование", "")),
+
+            "код": str(part.get("код", "")),
+            "code": str(part.get("код", "")),
+
+            "количество": str(quantity),
+            "qty": str(quantity),
+
+            # Комментарий — с одной или двумя «м», плюс английский
+            "коментарий": comment or "",
+            "комментарий": comment or "",
+            "comment": comment or "",
+        }
+
+        # Строка по фактическому порядку колонок
+        row = [values_by_key.get(hn, "") for hn in norm]
+
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        logger.info("💾 Списание записано в 'История' по текущим заголовкам")
     except Exception as e:
         logger.error(f"Ошибка записи списания: {e}")
         async def notify():
