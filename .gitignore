@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+.env
+
+# OS / tools
+.DS_Store
+pytest_cache/
+.coverage
+
+# Build
+build/
+dist/
+
+# Data/exports
+*.xlsx
+*.csv
+
+# Credentials (avoid accidental commits)
+credentials*.json
+service_account*.json
