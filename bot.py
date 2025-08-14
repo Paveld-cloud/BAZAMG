@@ -44,9 +44,9 @@ MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
-# Новые ENV для приветствия
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif или .mp4 (необязательно)
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # запасная картинка (если нет анимации)
+# Новые ENV для приветствия и поддержки
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # url или file_id
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
@@ -245,7 +245,7 @@ def normalize_drive_url(url: str) -> str:
     return url
 
 async def resolve_ibb_direct_async(url: str) -> str:
-    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...) — асинхронно."""
+    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=12) as resp:
@@ -497,43 +497,51 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = (user.first_name or "").strip() or "коллега"
 
-    # 1) Медиа-приветствие
-    sent_visual = False
+    # «Карточка» (HTML)
+    card_html = (
+        "⚙️ <b>Привет, {name}!</b>\n"
+        "<i>Инженерный бот для поиска и списания деталей</i>\n"
+        "────────\n"
+        "•&nbsp;&nbsp;Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
+        "•&nbsp;&nbsp;Откройте карточку и нажмите «📦 Взять деталь»\n"
+        "•&nbsp;&nbsp;Подтвердите списание — и готово\n\n"
+        "Пример: <code>PI 8808 DRG 500</code>\n"
+        "Удачной работы! 🚀"
+    ).format(name=first)
+
+    # 1) Анимация (если задана)
     try:
         if WELCOME_ANIMATION_URL:
             await context.bot.send_animation(
                 chat_id=chat_id,
                 animation=WELCOME_ANIMATION_URL,
-                caption=f"⚙️ Добро пожаловать, {first}! ⚙️",
-                parse_mode="Markdown"
+                caption=f"⚙️ <b>Добро пожаловать, {first}!</b>",
+                parse_mode="HTML",
             )
-            sent_visual = True
-        elif WELCOME_PHOTO_URL:
+            await asyncio.sleep(0.4)
+    except Exception as e:
+        logger.warning(f"Welcome animation failed: {e}")
+
+    # 2) Фото с карточкой (если задано)
+    try:
+        if WELCOME_PHOTO_URL:
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=WELCOME_PHOTO_URL,
-                caption=f"⚙️ Добро пожаловать, {first}! ⚙️",
-                parse_mode="Markdown"
+                caption=card_html,
+                parse_mode="HTML",
+                disable_notification=True,
+                reply_markup=main_menu_markup()
             )
-            sent_visual = True
+            return
     except Exception as e:
-        logger.warning(f"Welcome media failed: {e}")
+        logger.warning(f"Welcome photo failed: {e}")
 
-    # 2) Текст и меню
-    text_intro = (
-        f"⚙️ *Привет, {first}!* \n\n"
-        "Это инженерный бот для поиска и списания деталей.\n"
-        "— Введите *название*, *код* или *модель*.\n"
-        "— Для быстрого доступа используйте кнопки ниже.\n\n"
-        "Удачной работы! 🚀"
-    )
-    if sent_visual:
-        await asyncio.sleep(0.5)
-
+    # 3) Фолбэк — просто текст с меню
     await context.bot.send_message(
         chat_id=chat_id,
-        text=text_intro,
-        parse_mode="Markdown",
+        text=card_html,
+        parse_mode="HTML",
         reply_markup=main_menu_markup()
     )
 
@@ -543,10 +551,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
 
-    # Красочное приветствие
     await send_welcome_sequence(update, context)
 
-    # Подсказка по командам
+    # Подсказка по командам (в отдельном сообщении)
     if update.message:
         await asyncio.sleep(0.2)
         await update.message.reply_text(
@@ -555,7 +562,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /more — показать ещё\n"
             "• /export — выгрузка результатов (XLSX/CSV)\n"
             "• /cancel — отменить списание\n"
-            "• /reload — перезагрузка данных и пользователей (только админ)",
+            "• /reload — перезагрузка данных и пользователей (только админ)\n"
+            "• /fileid — режим получения file_id из отправленного медиа",
             parse_mode="Markdown"
         )
 
@@ -609,6 +617,40 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf.seek(0)
     buf.name = name
     return buf
+
+# ===== /fileid режим: быстро получить file_id из медиа =====
+async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["await_fileid"] = True
+    await update.message.reply_text(
+        "Отправьте фото/видео/гиф — отвечу его file_id. "
+        "Потом вставьте его в WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL."
+    )
+
+async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("await_fileid"):
+        return
+    file_id = None
+    kind = None
+
+    if update.message.animation:
+        file_id = update.message.animation.file_id
+        kind = "animation"
+    elif update.message.video:
+        file_id = update.message.video.file_id
+        kind = "video"
+    elif update.message.photo:
+        file_id = update.message.photo[-1].file_id  # самое крупное
+        kind = "photo"
+
+    if file_id:
+        context.user_data["await_fileid"] = False
+        await update.message.reply_text(
+            f"✅ {kind} file_id:\n<code>{file_id}</code>\n\n"
+            "Скопируйте в ENV: WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL.",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
 
 # Меню приветствия — callbacks
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -965,6 +1007,10 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
+    # /fileid
+    app.add_handler(CommandHandler("fileid", fileid_cmd))
+    app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
+
     # Меню приветствия
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
     app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
@@ -991,7 +1037,6 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
-        # Явно фиксируем per_* (может показать warning от PTB — это ок)
         per_chat=True,
         per_user=True,
         per_message=False,
