@@ -10,7 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
-from html import escape  # безопасный HTML
+from html import escape
 
 import aiohttp
 import gspread
@@ -46,11 +46,11 @@ TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
 # Приветствие / медиа
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id (если используешь видео/анимацию)
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id (если используешь ссылку/другой file_id)
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # gif/mp4/file_id анимации/видео
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id фото
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
 
-# Твой file_id для фото приветствия (будет использован в первую очередь)
+# Твой file_id для фото приветствия (используется в первую очередь)
 WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
@@ -506,7 +506,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # 1) Если есть анимация/видео — отправим (caption простой текст)
+    # 1) Анимация/видео (если указано)
     if WELCOME_ANIMATION_URL:
         try:
             await context.bot.send_animation(
@@ -518,7 +518,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
 
-    # 2) Если задан твой file_id — отправим фото по нему
+    # 2) Фото по file_id (приоритет)
     sent_media = False
     if WELCOME_MEDIA_ID:
         try:
@@ -528,7 +528,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by file_id failed: {e}")
 
-    # 3) Если не получилось/не задано — попробуем WELCOME_PHOTO_URL (URL или другой file_id)
+    # 3) Фото по URL/другому file_id
     if not sent_media and WELCOME_PHOTO_URL:
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
@@ -537,10 +537,10 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by URL/file_id failed: {e}")
 
-    # 4) Отдельным сообщением — «карточка» с HTML (безопасная отправка)
+    # 4) Карточка с подсказками (без «инженерный»)
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
+        f"<i>Бот для поиска и списания деталей</i>\n"
         f"────────\n"
         f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
         f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
@@ -623,7 +623,7 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf.name = name
     return buf
 
-# ===== /fileid режим: быстро получить file_id из медиа =====
+# ===== /fileid: получить file_id из медиа =====
 async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["await_fileid"] = True
     await update.message.reply_text(
@@ -663,7 +663,7 @@ async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
-    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+    await _safe_send_html_message(context.bot, q.message.chat.id, msg)
 
 async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -675,7 +675,7 @@ async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "3) Укажите количество и комментарий.\n"
         "4) Подтвердите списание кнопкой «Да»."
     )
-    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+    await _safe_send_html_message(context.bot, q.message.chat.id, msg)
 
 async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -901,10 +901,6 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
-async def handle_comment(update: Update, Context: ContextTypes.DEFAULT_TYPE):
-    # опечатка: сигнатура должна быть (update, context)
-    pass  # этот заглушечный хендлер не используется; настоящий ниже
-
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
 
@@ -1002,9 +998,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # Guards
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("more", more_cmd))
@@ -1016,14 +1014,16 @@ def build_app():
     app.add_handler(CommandHandler("fileid", fileid_cmd))
     app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
 
-    # Меню приветствия
+    # Welcome menu
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
     app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
     app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
 
+    # Pagination & cancel
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
+    # Conversation for issuing
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
@@ -1048,7 +1048,10 @@ def build_app():
     )
     app.add_handler(conv)
 
+    # Search
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
+
+    # Errors
     app.add_error_handler(on_error)
 
     return app
