@@ -10,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
+from html import escape  # ✅ для безопасного HTML
 
 import aiohttp
 import gspread
@@ -44,7 +45,7 @@ MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
-# Новые ENV для приветствия и поддержки
+# Приветствие
 WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id
 WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # url или file_id
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
@@ -68,21 +69,17 @@ _last_load_ts = 0.0
 _search_index: Optional[Dict[str, Set[int]]] = None
 _image_index: Optional[Dict[str, str]] = None
 
-# пользователи
 SHEET_ALLOWED: Set[int] = set()
 SHEET_ADMINS: Set[int] = set()
 SHEET_BLOCKED: Set[int] = set()
 _last_users_ts = 0.0
 
-# состояние поиска и списания
 user_state: Dict[int, Dict[str, Any]] = {}
 issue_state: Dict[int, Dict[str, Any]] = {}
 
-# флаги фоновых задач
 _loading_data = False
 _loading_users = False
 
-# шаги диалога
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ------------------------- КНОПКИ ---------------------------
@@ -110,6 +107,16 @@ def main_menu_markup():
 async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
+async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
+    """Отправка HTML с фолбэком в обычный текст, если парсер Телеграма ругнётся."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
+    except Exception as e:
+        logger.warning(f"HTML message parse failed, fallback to plain: {e}")
+        no_tags = re.sub(r"</?(b|i|code)>", "", text)
+        kwargs.pop("parse_mode", None)
+        return await bot.send_message(chat_id=chat_id, text=no_tags, **kwargs)
+
 # ------------------------- GOOGLE SHEETS ---------------------
 def get_gs_client():
     creds_info = json.loads(CREDS_JSON)
@@ -133,7 +140,6 @@ def load_data_blocking() -> list[dict]:
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
 
 def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
-    """Инвертированный индекс: токен -> множество индексов строк."""
     index: DefaultDict[str, Set[int]] = defaultdict(set)
     for col in SEARCH_FIELDS:
         if col not in df.columns:
@@ -145,7 +151,6 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
     return dict(index)
 
 def build_image_index(df: DataFrame) -> Dict[str, str]:
-    """'код' -> сырой URL (без сетевых запросов)."""
     if "image" not in df.columns:
         return {}
     index = {}
@@ -245,7 +250,6 @@ def normalize_drive_url(url: str) -> str:
     return url
 
 async def resolve_ibb_direct_async(url: str) -> str:
-    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=12) as resp:
@@ -495,36 +499,37 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
 async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    first = (user.first_name or "").strip() or "коллега"
+    # Экранируем имя для HTML
+    first = escape((user.first_name or "").strip() or "коллега")
 
-    # «Карточка» (HTML)
+    # Аккуратная карточка (только поддерживаемые теги)
     card_html = (
-        "⚙️ <b>Привет, {name}!</b>\n"
-        "<i>Инженерный бот для поиска и списания деталей</i>\n"
-        "────────\n"
-        "•&nbsp;&nbsp;Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
-        "•&nbsp;&nbsp;Откройте карточку и нажмите «📦 Взять деталь»\n"
-        "•&nbsp;&nbsp;Подтвердите списание — и готово\n\n"
-        "Пример: <code>PI 8808 DRG 500</code>\n"
-        "Удачной работы! 🚀"
-    ).format(name=first)
+        f"⚙️ <b>Привет, {first}!</b>\n"
+        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
+        f"────────\n"
+        f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
+        f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
+        f"• Подтвердите списание — и готово\n\n"
+        f"Пример: <code>PI 8808 DRG 500</code>\n"
+        f"Удачной работы! 🚀"
+    )
 
     # 1) Анимация (если задана)
-    try:
-        if WELCOME_ANIMATION_URL:
+    if WELCOME_ANIMATION_URL:
+        try:
             await context.bot.send_animation(
                 chat_id=chat_id,
                 animation=WELCOME_ANIMATION_URL,
                 caption=f"⚙️ <b>Добро пожаловать, {first}!</b>",
                 parse_mode="HTML",
             )
-            await asyncio.sleep(0.4)
-    except Exception as e:
-        logger.warning(f"Welcome animation failed: {e}")
+            await asyncio.sleep(0.35)
+        except Exception as e:
+            logger.warning(f"Welcome animation failed: {e}")
 
-    # 2) Фото с карточкой (если задано)
-    try:
-        if WELCOME_PHOTO_URL:
+    # 2) Фото с карточкой в подписи
+    if WELCOME_PHOTO_URL:
+        try:
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=WELCOME_PHOTO_URL,
@@ -534,16 +539,18 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=main_menu_markup()
             )
             return
-    except Exception as e:
-        logger.warning(f"Welcome photo failed: {e}")
+        except Exception as e:
+            logger.warning(f"Welcome photo (HTML) failed: {e}")
+            # Фото без подписи, карточка отдельным сообщением (надёжный путь)
+            try:
+                await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
+            except Exception as e2:
+                logger.warning(f"Welcome photo (plain) failed too: {e2}")
+            await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
+            return
 
-    # 3) Фолбэк — просто текст с меню
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=card_html,
-        parse_mode="HTML",
-        reply_markup=main_menu_markup()
-    )
+    # 3) Фолбэк — просто карточка
+    await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # ------------------------- КОМАНДЫ --------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -553,7 +560,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_welcome_sequence(update, context)
 
-    # Подсказка по командам (в отдельном сообщении)
     if update.message:
         await asyncio.sleep(0.2)
         await update.message.reply_text(
@@ -639,15 +645,16 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.video.file_id
         kind = "video"
     elif update.message.photo:
-        file_id = update.message.photo[-1].file_id  # самое крупное
+        file_id = update.message.photo[-1].file_id
         kind = "photo"
 
     if file_id:
         context.user_data["await_fileid"] = False
-        await update.message.reply_text(
-            f"✅ {kind} file_id:\n<code>{file_id}</code>\n\n"
-            "Скопируйте в ENV: WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL.",
-            parse_mode="HTML"
+        await _safe_send_html_message(
+            context.bot,
+            update.effective_chat.id,
+            f"✅ {kind} file_id:\n<code>{escape(file_id)}</code>\n\n"
+            f"Скопируйте в ENV: WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL."
         )
     else:
         await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
@@ -677,7 +684,6 @@ async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------- ПОИСК -----------------------------
 def match_row_by_index(tokens: List[str]) -> Set[int]:
-    """Точный быстрый матч по индексу (все токены как слова)."""
     if not _search_index:
         return set()
     result = None
@@ -695,7 +701,6 @@ def _safe_col(df: DataFrame, col: str) -> Optional[pd.Series]:
     return df[col].astype(str).str.lower() if col in df.columns else None
 
 def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
-    """Скоринг релевантности: точные токены > подстроки; boost код/oem; слитный матч."""
     score = 0
     for f in SEARCH_FIELDS:
         val = str(row.get(f, "")).lower()
@@ -745,10 +750,8 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if df is None:
             return await update.message.reply_text("Ошибка загрузки данных.")
 
-    # 1) быстрый точный индекс
     matched_indices = match_row_by_index(tokens)
 
-    # 2) подстроки по любому полю (все токены должны встретиться в одном поле)
     if not matched_indices:
         mask_any = pd.Series(False, index=df.index)
         for col in SEARCH_FIELDS:
@@ -762,7 +765,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mask_any |= field_mask
         matched_indices = set(df.index[mask_any])
 
-    # 3) «слитный» фолбэк по всем полям
     if not matched_indices and q_squash:
         mask_any = pd.Series(False, index=df.index)
         for col in SEARCH_FIELDS:
@@ -776,7 +778,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
-    # Ранжируем по релевантности
     idx_list = list(matched_indices)
     results_df = df.loc[idx_list].copy()
 
