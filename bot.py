@@ -44,6 +44,11 @@ MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
+# Новые ENV для приветствия
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif или .mp4 (необязательно)
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # запасная картинка (если нет анимации)
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
+
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
 
@@ -94,6 +99,13 @@ def confirm_markup():
 def more_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
 
+def main_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search")],
+        [InlineKeyboardButton("📦 Как списать деталь", callback_data="menu_issue_help")],
+        [InlineKeyboardButton("📞 Поддержка", callback_data="menu_contact")],
+    ])
+
 # ------------------------- ВСПОМОГАТЕЛЬНОЕ -------------------
 async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
@@ -126,7 +138,6 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
     for col in SEARCH_FIELDS:
         if col not in df.columns:
             continue
-        # .items() безопасно с pandas 2.x
         for idx, val in df[col].astype(str).str.lower().items():
             for t in re.findall(r'\w+', val):
                 if t:
@@ -480,22 +491,73 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
                     pass
         asyncio.create_task(notify())
 
+# ------------------------- ПРИВЕТСТВИЕ -----------------------
+async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    first = (user.first_name or "").strip() or "коллега"
+
+    # 1) Медиа-приветствие
+    sent_visual = False
+    try:
+        if WELCOME_ANIMATION_URL:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=WELCOME_ANIMATION_URL,
+                caption=f"⚙️ Добро пожаловать, {first}! ⚙️",
+                parse_mode="Markdown"
+            )
+            sent_visual = True
+        elif WELCOME_PHOTO_URL:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=WELCOME_PHOTO_URL,
+                caption=f"⚙️ Добро пожаловать, {first}! ⚙️",
+                parse_mode="Markdown"
+            )
+            sent_visual = True
+    except Exception as e:
+        logger.warning(f"Welcome media failed: {e}")
+
+    # 2) Текст и меню
+    text_intro = (
+        f"⚙️ *Привет, {first}!* \n\n"
+        "Это инженерный бот для поиска и списания деталей.\n"
+        "— Введите *название*, *код* или *модель*.\n"
+        "— Для быстрого доступа используйте кнопки ниже.\n\n"
+        "Удачной работы! 🚀"
+    )
+    if sent_visual:
+        await asyncio.sleep(0.5)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text_intro,
+        parse_mode="Markdown",
+        reply_markup=main_menu_markup()
+    )
+
 # ------------------------- КОМАНДЫ --------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     user_state.pop(uid, None)
-    await update.message.reply_text(
-        "Привет! Напиши запрос: по наименованию (например, `ПОДШЛЕМНИК`) "
-        "или по типу/коду (например, `PI 8808 DRG 500` или слитно `PI8808DRG500`).\n\n"
-        "Команды:\n"
-        "• /help — помощь\n"
-        "• /more — показать ещё\n"
-        "• /export — выгрузка результатов (XLSX/CSV)\n"
-        "• /cancel — отменить списание\n"
-        "• /reload — перезагрузить данные и пользователей (только админ)",
-        parse_mode="Markdown"
-    )
+
+    # Красочное приветствие
+    await send_welcome_sequence(update, context)
+
+    # Подсказка по командам
+    if update.message:
+        await asyncio.sleep(0.2)
+        await update.message.reply_text(
+            "Команды:\n"
+            "• /help — помощь\n"
+            "• /more — показать ещё\n"
+            "• /export — выгрузка результатов (XLSX/CSV)\n"
+            "• /cancel — отменить списание\n"
+            "• /reload — перезагрузка данных и пользователей (только админ)",
+            parse_mode="Markdown"
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -548,6 +610,29 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf.name = name
     return buf
 
+# Меню приветствия — callbacks
+async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text("🔍 Введите запрос: название/модель/код. Пример: `PI 8808 DRG 500`", parse_mode="Markdown")
+
+async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(
+        "Как списать деталь:\n"
+        "1) Выполните поиск по названию/коду.\n"
+        "2) В карточке нажмите «📦 Взять деталь».\n"
+        "3) Укажите количество и комментарий.\n"
+        "4) Подтвердите списание кнопкой «Да».",
+        parse_mode="Markdown"
+    )
+
+async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(f"{SUPPORT_CONTACT}")
+
 # ------------------------- ПОИСК -----------------------------
 def match_row_by_index(tokens: List[str]) -> Set[int]:
     """Точный быстрый матч по индексу (все токены как слова)."""
@@ -568,21 +653,17 @@ def _safe_col(df: DataFrame, col: str) -> Optional[pd.Series]:
     return df[col].astype(str).str.lower() if col in df.columns else None
 
 def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
-    """Лёгкий скоринг релевантности: точные токены > подстроки; boost код/oem; слитный матч."""
+    """Скоринг релевантности: точные токены > подстроки; boost код/oem; слитный матч."""
     score = 0
     for f in SEARCH_FIELDS:
         val = str(row.get(f, "")).lower()
         if not val:
             continue
-        # точный токен в поле
         words = set(re.findall(r'\w+', val))
         tok_hit = sum(1 for t in tokens if t in words)
-        # подстрока
         sub_hit = sum(1 for t in tokens if t and t in val)
-        # слитный
         sq = re.sub(r'[\W_]+', '', val)
         squash_hit = 1 if q_squash and q_squash in sq else 0
-
         weight = 2 if f in ("код", "oem") else 1
         score += weight * (2 * tok_hit + sub_hit) + 3 * squash_hit * weight
     return score
@@ -653,16 +734,15 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
-    # Формируем результат + ранжируем по релевантности (легкий скоринг)
+    # Ранжируем по релевантности
     idx_list = list(matched_indices)
     results_df = df.loc[idx_list].copy()
 
-    # считаем скор только по найденным строкам (быстро)
     scores: List[int] = []
     for _, r in results_df.iterrows():
         scores.append(_relevance_score(r.to_dict(), tokens, q_squash))
     results_df["__score"] = scores
-    # короткий код при прочих равных наверх
+
     if "код" in results_df.columns:
         results_df = results_df.sort_values(
             by=["__score", "код"],
@@ -885,6 +965,11 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
+    # Меню приветствия
+    app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
+    app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
+    app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
+
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
@@ -906,7 +991,7 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
-        # Явно фиксируем per_* чтобы убрать предупреждение и контролировать поведение
+        # Явно фиксируем per_* (может показать warning от PTB — это ок)
         per_chat=True,
         per_user=True,
         per_message=False,
