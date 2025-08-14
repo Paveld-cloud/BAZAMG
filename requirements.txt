@@ -4,4 +4,4 @@ pandas
 openpyxl
 python-telegram-bot[webhooks]==20.3
 aiohttp
-aiogram==2.25.1
+
