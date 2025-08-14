@@ -10,9 +10,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
-from html import escape
+from html import escape  # безопасный HTML
 
-import requests
 import aiohttp
 import gspread
 import pandas as pd
@@ -32,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bot")
 
 # -------------------------- НАСТРОЙКИ -----------------------
-ADMINS = {225177765}  # локальные админы (дополни при необходимости)
+ADMINS = {225177765}  # локальные админы
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
@@ -46,11 +45,13 @@ MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
-# Приветственный медиаконтент (твои значения)
-WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()
+# Приветствие / медиа
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id (если используешь видео/анимацию)
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id (если используешь ссылку/другой file_id)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
+
+# Твой file_id для фото приветствия (будет использован в первую очередь)
+WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
@@ -100,9 +101,9 @@ def more_markup():
 
 def main_menu_markup():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Поиск", callback_data="menu_search")],
-        [InlineKeyboardButton("📦 Как списать деталь", callback_data="menu_howto")],
-        [InlineKeyboardButton("🛟 Поддержка", callback_data="menu_support")],
+        [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search")],
+        [InlineKeyboardButton("📦 Как списать деталь", callback_data="menu_issue_help")],
+        [InlineKeyboardButton("📞 Поддержка", callback_data="menu_contact")],
     ])
 
 # ------------------------- ВСПОМОГАТЕЛЬНОЕ -------------------
@@ -111,13 +112,12 @@ async def _to_thread(fn, *args, **kwargs):
 
 async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
     """
-    Попытка отправить HTML; при ошибке — шлём plain text (фолбэк).
+    Пытаемся отправить HTML. Если парсер Телеграма ругнётся — шлём как обычный текст без форматирования.
     """
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
     except Exception as e:
-        logger.warning(f"HTML parse failed, fallback plain: {e}")
-        # убираем теги <b>, <i>, <code> для фолбэка
+        logger.warning(f"HTML message parse failed, fallback to plain: {e}")
         no_tags = re.sub(r"</?(b|i|code)>", "", text)
         kwargs.pop("parse_mode", None)
         return await bot.send_message(chat_id=chat_id, text=no_tags, **kwargs)
@@ -254,26 +254,27 @@ def normalize_drive_url(url: str) -> str:
         return f'https://drive.google.com/uc?export=download&id={file_id}'
     return url
 
-def resolve_ibb_direct(url: str) -> str:
+async def resolve_ibb_direct_async(url: str) -> str:
     try:
-        resp = requests.get(url, timeout=12)
-        resp.raise_for_status()
-        html_txt = resp.text
-        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
-        if m:
-            return m.group(1)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    return url
+                html = await resp.text()
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        return m.group(1) if m else url
     except Exception as e:
-        logger.warning(f"resolve_ibb_direct fail: {e}")
-    return url
+        logger.warning(f"resolve_ibb_direct_async fail: {e}")
+        return url
 
-def resolve_image_url(u: str) -> str:
+async def resolve_image_url_async(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return u
     if "drive.google.com" in u:
         return normalize_drive_url(u)
     if re.match(r"^https?://(www\.)?ibb\.co/", u, re.I):
-        return resolve_ibb_direct(u)
+        return await resolve_ibb_direct_async(u)
     return u
 
 async def find_image_by_code_async(code: str) -> str:
@@ -301,21 +302,21 @@ async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
     url_raw = await find_image_by_code_async(code)
-    url = resolve_image_url(url_raw)
+    url = await resolve_image_url_async(url_raw)
 
     if url:
         try:
             await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
-            logger.warning(f"URL photo failed ({url}): {e}")
+            logger.warning(f"URL фото не сработал ({url}): {e}")
             bio = await _download_image_async(url)
             if bio:
                 try:
                     await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
                     return
                 except Exception as e2:
-                    logger.warning(f"Download/send photo failed: {e2} (src: {url})")
+                    logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
 
     await update.message.reply_text(text, reply_markup=kb)
 
@@ -323,20 +324,20 @@ async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
     url_raw = await find_image_by_code_async(code)
-    url = resolve_image_url(url_raw)
+    url = await resolve_image_url_async(url_raw)
     if url:
         try:
             await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
-            logger.warning(f"URL photo failed ({url}): {e}")
+            logger.warning(f"URL фото не сработал ({url}): {e}")
             bio = await _download_image_async(url)
             if bio:
                 try:
                     await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
                     return
                 except Exception as e2:
-                    logger.warning(f"Send downloaded photo failed: {e2} (src: {url})")
+                    logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 # --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
@@ -505,67 +506,49 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    caption_html = (
+    # 1) Если есть анимация/видео — отправим (caption простой текст)
+    if WELCOME_ANIMATION_URL:
+        try:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=WELCOME_ANIMATION_URL,
+                caption=f"⚙️ Добро пожаловать, {first}!"
+            )
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Welcome animation failed: {e}")
+
+    # 2) Если задан твой file_id — отправим фото по нему
+    sent_media = False
+    if WELCOME_MEDIA_ID:
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, disable_notification=True)
+            sent_media = True
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Welcome photo by file_id failed: {e}")
+
+    # 3) Если не получилось/не задано — попробуем WELCOME_PHOTO_URL (URL или другой file_id)
+    if not sent_media and WELCOME_PHOTO_URL:
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
+            sent_media = True
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Welcome photo by URL/file_id failed: {e}")
+
+    # 4) Отдельным сообщением — «карточка» с HTML (безопасная отправка)
+    card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<i>Бот для поиска и списания деталей</i>\n\n"
+        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
+        f"────────\n"
         f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
         f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
         f"• Подтвердите списание — и готово\n\n"
         f"Пример: <code>PI 8808 DRG 500</code>\n"
         f"Удачной работы! 🚀"
     )
-
-    sent = False
-
-    # 1) попытка отправить анимацию (если указана)
-    if WELCOME_ANIMATION_URL and not sent:
-        try:
-            await context.bot.send_animation(
-                chat_id=chat_id,
-                animation=WELCOME_ANIMATION_URL,
-                caption=caption_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup()
-            )
-            sent = True
-        except Exception as e:
-            logger.warning(f"Welcome animation failed: {e}")
-
-    # 2) фото по file_id (основной сценарий)
-    if not sent and WELCOME_MEDIA_ID:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=WELCOME_MEDIA_ID,
-                caption=caption_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup()
-            )
-            sent = True
-        except Exception as e:
-            logger.warning(f"Welcome photo by file_id failed: {e}")
-
-    # 3) фото по URL
-    if not sent and WELCOME_PHOTO_URL:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=WELCOME_PHOTO_URL,
-                caption=caption_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup()
-            )
-            sent = True
-        except Exception as e:
-            logger.warning(f"Welcome photo by URL failed: {e}")
-
-    # 4) фолбэк: простой текст
-    if not sent:
-        try:
-            await _safe_send_html_message(context.bot, chat_id, caption_html, reply_markup=main_menu_markup())
-        except Exception as e:
-            logger.warning(f"Welcome text failed: {e}")
-            await context.bot.send_message(chat_id=chat_id, text=re.sub(r"</?(b|i|code)>", "", caption_html))
+    await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # ------------------------- КОМАНДЫ --------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,23 +559,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_welcome_sequence(update, context)
 
     if update.message:
-        await asyncio.sleep(0.1)
-        await update.message.reply_text(
-            "Команды:\n"
-            "• /help — помощь\n"
-            "• /more — показать ещё\n"
-            "• /export — выгрузка результатов (XLSX/CSV)\n"
-            "• /cancel — отменить списание\n"
-            "• /reload — перезагрузка данных и пользователей (только админ)"
+        await asyncio.sleep(0.2)
+        cmds_html = (
+            "<b>Команды</b>:\n"
+            "• <code>/help</code> — помощь\n"
+            "• <code>/more</code> — показать ещё\n"
+            "• <code>/export</code> — выгрузка результатов (XLSX/CSV)\n"
+            "• <code>/cancel</code> — отменить списание\n"
+            "• <code>/reload</code> — перезагрузка данных и пользователей (только админ)\n"
+            "• <code>/fileid</code> — получить <i>file_id</i> из присланного медиа\n"
         )
+        await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    msg = (
+        "<b>Как пользоваться</b>:\n"
         "1) Выполните поиск по названию/модели/коду.\n"
-        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий,\n"
-        "   затем попросит подтвердить списание (Да/Нет).\n"
-        "У ВАС ВСЕ ПОЛУЧИТСЯ."
+        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий.\n"
+        "3) Подтвердите списание (Да/Нет).\n"
+        "<i>У вас всё получится!</i>"
     )
+    await _safe_send_html_message(context.bot, update.effective_chat.id, msg)
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -636,29 +623,64 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf.name = name
     return buf
 
-# ===== /fileid helper =====
+# ===== /fileid режим: быстро получить file_id из медиа =====
 async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["await_fileid"] = True
-    await update.message.reply_text("Отправьте фото/видео/гиф — отвечу его file_id.")
+    await update.message.reply_text(
+        "Отправьте фото/видео/гиф — отвечу его file_id. "
+        "Потом вставьте его в WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHOTO_URL."
+    )
 
 async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("await_fileid"):
         return
     file_id = None
     kind = None
+
     if update.message.animation:
-        file_id = update.message.animation.file_id; kind = "animation"
+        file_id = update.message.animation.file_id
+        kind = "animation"
     elif update.message.video:
-        file_id = update.message.video.file_id; kind = "video"
+        file_id = update.message.video.file_id
+        kind = "video"
     elif update.message.photo:
-        file_id = update.message.photo[-1].file_id; kind = "photo"
+        file_id = update.message.photo[-1].file_id  # самое крупное
+        kind = "photo"
 
     if file_id:
         context.user_data["await_fileid"] = False
-        await _safe_send_html_message(context.bot, update.effective_chat.id,
-            f"✅ {kind} file_id:\n<code>{escape(file_id)}</code>\n\nСкопируйте в WELCOME_MEDIA_ID или ENV.")
+        await _safe_send_html_message(
+            context.bot,
+            update.effective_chat.id,
+            f"✅ {kind} file_id:\n<code>{escape(file_id)}</code>\n\n"
+            f"Скопируйте в ENV: WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHOTO_URL."
+        )
     else:
-        await update.message.reply_text("Не поддерживаемое медиа. Отправьте фото/видео/гиф.")
+        await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
+
+# Меню приветствия — callbacks
+async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+
+async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = (
+        "<b>Как списать деталь</b>:\n"
+        "1) Выполните поиск по названию/коду.\n"
+        "2) В карточке нажмите «📦 Взять деталь».\n"
+        "3) Укажите количество и комментарий.\n"
+        "4) Подтвердите списание кнопкой «Да»."
+    )
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+
+async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(f"{SUPPORT_CONTACT}")
 
 # ------------------------- ПОИСК -----------------------------
 def match_row_by_index(tokens: List[str]) -> Set[int]:
@@ -705,9 +727,15 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st_issue = issue_state.get(uid)
     if st_issue:
         if "quantity" not in st_issue:
-            return await update.message.reply_text("Вы вводите количество. Введите число или нажмите «Отменить».", reply_markup=cancel_markup())
+            return await update.message.reply_text(
+                "Вы вводите количество. Введите число или нажмите «Отменить».",
+                reply_markup=cancel_markup()
+            )
         if st_issue.get("await_comment"):
-            return await update.message.reply_text("Вы вводите комментарий. Напишите текст или «-», либо нажмите «Отменить».", reply_markup=cancel_markup())
+            return await update.message.reply_text(
+                "Вы вводите комментарий. Напишите текст или «-», либо нажмите «Отменить».",
+                reply_markup=cancel_markup()
+            )
 
     q = update.message.text.strip()
     if not q:
@@ -724,7 +752,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     matched_indices = match_row_by_index(tokens)
 
-    # fallback: полное contains по столбцу код
     if not matched_indices:
         mask_any = pd.Series(False, index=df.index)
         for col in SEARCH_FIELDS:
@@ -738,7 +765,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mask_any |= field_mask
         matched_indices = set(df.index[mask_any])
 
-    # слитный код fallback
     if not matched_indices and q_squash:
         mask_any = pd.Series(False, index=df.index)
         for col in SEARCH_FIELDS:
@@ -761,7 +787,11 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results_df["__score"] = scores
 
     if "код" in results_df.columns:
-        results_df = results_df.sort_values(by=["__score", "код"], ascending=[False, True], key=lambda s: s if s.name != "код" else s.astype(str).str.len())
+        results_df = results_df.sort_values(
+            by=["__score", "код"],
+            ascending=[False, True],
+            key=lambda s: s if s.name != "код" else s.astype(str).str.len()
+        )
     else:
         results_df = results_df.sort_values(by=["__score"], ascending=False)
     results_df = results_df.drop(columns="__score")
@@ -828,6 +858,7 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     uid = q.from_user.id
     code = q.data.split(":", 1)[1].strip().lower()
 
@@ -847,6 +878,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
+
     uid = update.effective_user.id
     text = (update.message.text or "").strip().replace(",", ".")
     try:
@@ -855,7 +887,10 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
         qty = float(f"{qty:.3f}")
     except Exception:
-        return await update.message.reply_text(f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5", reply_markup=cancel_markup())
+        return await update.message.reply_text(
+            f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
+            reply_markup=cancel_markup()
+        )
 
     st = issue_state.get(uid)
     if not st or "part" not in st:
@@ -866,8 +901,13 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
+async def handle_comment(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+    # опечатка: сигнатура должна быть (update, context)
+    pass  # этот заглушечный хендлер не используется; настоящий ниже
+
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
+
     uid = update.effective_user.id
     comment = (update.message.text or "").strip()
     st = issue_state.get(uid)
@@ -906,9 +946,16 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         part = st["part"]
         qty = st["quantity"]
         comment = st.get("comment", "")
+
         await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
         issue_state.pop(uid, None)
-        await q.message.reply_text(f"✅ Списано: {qty}\n🔢 Код: {val(part, 'код')}\n📦 Наименование: {val(part, 'наименование')}\n💬 Комментарий: {comment or '—'}")
+
+        await q.message.reply_text(
+            f"✅ Списано: {qty}\n"
+            f"🔢 Код: {val(part, 'код')}\n"
+            f"📦 Наименование: {val(part, 'наименование')}\n"
+            f"💬 Комментарий: {comment or '—'}"
+        )
         return ConversationHandler.END
 
     if q.data == "confirm_no":
@@ -941,23 +988,6 @@ async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat.id
     await send_page_via_bot(context.bot, chat_id, uid)
 
-# --------------------- MENU ROUTER -------------------------
-async def menu_buttons_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if data == "menu_howto":
-        return await q.message.reply_text(
-            "Как списать деталь:\n1) Введите запрос, откройте подходящую карточку.\n"
-            "2) Нажмите «📦 Взять деталь».\n3) Укажите количество и комментарий.\n4) Подтвердите списание."
-        )
-    if data == "menu_support":
-        return await q.message.reply_text(SUPPORT_CONTACT)
-    if data == "menu_search":
-        return await q.message.reply_text("Напишите запрос (название/код/модель).")
-    if data == "more":
-        return await more_cmd(update, context)
-
 # --------------------- ERROR HANDLER -------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error: %s", context.error)
@@ -968,32 +998,32 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# --------------------- APP / WEBHOOK (ENTRY) ------------------------
+# --------------------- APP / WEBHOOK ------------------------
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Guards
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("more", more_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+
+    # /fileid
     app.add_handler(CommandHandler("fileid", fileid_cmd))
     app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
 
-    # Menu buttons
-    app.add_handler(CallbackQueryHandler(menu_buttons_router, pattern=r"^(menu_howto|menu_support|menu_search|more)$"))
+    # Меню приветствия
+    app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
+    app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
+    app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
 
-    # More / cancel actions
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
-    # Conversation for issuing
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
@@ -1012,43 +1042,35 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
-        per_message=True,
+        per_chat=True,
+        per_user=True,
+        per_message=False,
     )
     app.add_handler(conv)
 
-    # Search handler (after conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
-
-    # Error handler
     app.add_error_handler(on_error)
 
     return app
 
-def main():
+if __name__ == "__main__":
     logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
     if not WEBHOOK_SECRET_TOKEN:
         logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется включить для продакшена.")
 
     initial_load()
-    ensure_users(force=True)
+    application = build_app()
 
-    app = build_app()
-
-    # Use Application.run_webhook so PTB handles initialize/start/stop lifecycle
-    url_path = WEBHOOK_PATH.lstrip("/")
-    webhook_full = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-
+    full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     logger.info(f"🚀 Стартуем webhook-сервер на 0.0.0.0:{PORT}")
-    logger.info(f"🌐 Устанавливаем webhook: {webhook_full}")
+    logger.info(f"🌐 Устанавливаем webhook: {full_webhook}")
 
-    app.run_webhook(
+    application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=url_path,
-        webhook_url=webhook_full,
-        secret_token=(WEBHOOK_SECRET_TOKEN or None),
+        secret_token=WEBHOOK_SECRET_TOKEN or None,
+        webhook_url=full_webhook,
+        url_path=WEBHOOK_PATH.lstrip("/"),
         drop_pending_updates=True,
+        allowed_updates=None,
     )
-
-if __name__ == "__main__":
-    main()
