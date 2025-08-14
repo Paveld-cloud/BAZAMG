@@ -1,3 +1,4 @@
+# bot.py
 import os
 import re
 import io
@@ -9,6 +10,7 @@ import logging
 from datetime import datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo  # локальное время для Истории
+from typing import Optional
 
 import requests
 import gspread
@@ -39,6 +41,12 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
 
+# имя листа с данными; если не найден — fallback на sheet1
+SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
+
+# Бизнес-лимит списания
+MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
+
 # Часовой пояс для записи в Историю
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
@@ -61,7 +69,7 @@ PAGE_SIZE = 5
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
-df: DataFrame | None = None
+df: Optional[DataFrame] = None
 _last_load_ts = 0.0
 
 # пользователи из листа
@@ -95,32 +103,73 @@ def confirm_markup():
 def more_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
 
+# --------------------- ВСПОМОГАТЕЛЬНОЕ (IO → фон) ----------
+async def _to_thread(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
 # ------------------------- GOOGLE SHEETS ---------------------
 def get_gs_client():
     creds_info = json.loads(CREDS_JSON)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def load_data() -> list[dict]:
+def _open_data_worksheet(client):
+    sh = client.open_by_url(SPREADSHEET_URL)
+    if SHEET_NAME:
+        try:
+            return sh.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            logger.warning(f"Лист {SHEET_NAME!r} не найден, fallback на sheet1")
+    return sh.sheet1
+
+def load_data_blocking() -> list[dict]:
     client = get_gs_client()
-    sheet = client.open_by_url(SPREADSHEET_URL)
-    ws = sheet.sheet1   # при необходимости замени на worksheet("SAP")
+    ws = _open_data_worksheet(client)
     return ws.get_all_records()
 
-def ensure_fresh_data(force: bool = False):
+def initial_load():
+    """Блокирующая первичная загрузка при старте — можно, т.к. делается один раз."""
+    global df, _last_load_ts, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
+    data = load_data_blocking()
+    new_df = DataFrame(data)
+    new_df.columns = new_df.columns.str.strip().str.lower()
+    for col in ("код", "oem"):
+        if col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+    if "image" in new_df.columns:
+        new_df["image"] = new_df["image"].astype(str).str.strip()
+    df = new_df
+    _last_load_ts = time.time()
+    logger.info(f"✅ Загружено (startup) {len(df)} строк из Google Sheet")
+
+    # пользователи
+    allowed, admins, blocked = load_users_from_sheet()
+    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
+    _last_users_ts = time.time()
+    logger.info(f"👥 Пользователи (startup): allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+
+async def ensure_fresh_data_async(force: bool = False):
     global df, _last_load_ts
-    if force or df is None or (time.time() - _last_load_ts > DATA_TTL):
-        data = load_data()
-        new_df = DataFrame(data)
-        new_df.columns = new_df.columns.str.strip().str.lower()
-        for col in ("код", "oem"):
-            if col in new_df.columns:
-                new_df[col] = new_df[col].astype(str).str.strip().str.lower()
-        if "image" in new_df.columns:
-            new_df["image"] = new_df["image"].astype(str).str.strip()
-        df = new_df
-        _last_load_ts = time.time()
-        logger.info(f"✅ Загружено {len(df)} строк из Google Sheet")
+    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
+        return
+    data = await _to_thread(load_data_blocking)
+    new_df = DataFrame(data)
+    new_df.columns = new_df.columns.str.strip().str.lower()
+    for col in ("код", "oem"):
+        if col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+    if "image" in new_df.columns:
+        new_df["image"] = new_df["image"].astype(str).str.strip()
+    df = new_df
+    _last_load_ts = time.time()
+    logger.info(f"✅ Загружено {len(df)} строк из Google Sheet (async)")
+
+def ensure_fresh_data(force: bool = False):
+    """Мгновенный возврат + фоновая перезагрузка при необходимости."""
+    global df, _last_load_ts
+    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
+        return
+    asyncio.create_task(ensure_fresh_data_async(force=True))
 
 # ------------------------- УТИЛИТЫ --------------------------
 def val(row: dict, key: str, default: str = "—") -> str:
@@ -175,8 +224,8 @@ def resolve_ibb_direct(url: str) -> str:
         logger.warning(f"resolve_ibb_direct fail: {e}")
     return url
 
-def resolve_image_url(url: str) -> str:
-    u = (url or "").strip()
+def resolve_image_url(u: str) -> str:
+    u = (u or "").strip()
     if not u:
         return u
     if "drive.google.com" in u:
@@ -188,8 +237,8 @@ def resolve_image_url(url: str) -> str:
 def find_image_by_code(code: str) -> str:
     """
     Ищем ссылку на фото по КОДУ в столбце image (по всему листу).
-    1) Точнее: код как токен в URL/имени файла (/, _, -, или расширение .png/.jpg и т.п.).
-    2) Если не нашли — простой contains (case-insensitive).
+    1) Токен-совпадение в URL/имени файла (/, _, -, или расширение .png/.jpg и т.п.).
+    2) Фолбэк: простое contains (case-insensitive).
     """
     if df is None or "image" not in df.columns:
         return ""
@@ -214,6 +263,29 @@ def find_image_by_code(code: str) -> str:
 
     return ""
 
+def _download_image(url: str, timeout: int = 12, max_bytes: int = 5_000_000) -> Optional[BytesIO]:
+    r = requests.get(url, timeout=timeout, stream=True, allow_redirects=True)
+    r.raise_for_status()
+    total = 0
+    bio = BytesIO()
+    for chunk in r.iter_content(8192):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError("Image too large")
+        bio.write(chunk)
+    bio.seek(0)
+    bio.name = "image"
+    return bio
+
+async def _download_image_async(url: str) -> Optional[BytesIO]:
+    try:
+        return await _to_thread(_download_image, url)
+    except Exception as e:
+        logger.warning(f"_download_image_async fail: {e}")
+        return None
+
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
@@ -221,22 +293,18 @@ async def send_row_with_image(update: Update, row: dict, text: str):
 
     if url:
         try:
+            # Телеграм сам скачает URL (не блокирует наш event-loop)
             await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
             logger.warning(f"URL фото не сработал ({url}): {e}")
-            try:
-                r = requests.get(url, timeout=15, allow_redirects=True)
-                r.raise_for_status()
-                bio = BytesIO(r.content)
-                ctype = r.headers.get("Content-Type", "").lower()
-                if "image" not in ctype:
-                    logger.warning(f"Получили non-image Content-Type ({ctype}) с {url}")
-                bio.name = "image"
-                await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
-                return
-            except Exception as e2:
-                logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
+            bio = await _download_image_async(url)
+            if bio:
+                try:
+                    await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
+                    return
+                except Exception as e2:
+                    logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
 
     await update.message.reply_text(text, reply_markup=kb)
 
@@ -250,14 +318,13 @@ async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
             return
         except Exception as e:
             logger.warning(f"URL фото не сработал ({url}): {e}")
-            try:
-                r = requests.get(url, timeout=15, allow_redirects=True)
-                r.raise_for_status()
-                bio = BytesIO(r.content); bio.name = "image"
-                await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
-                return
-            except Exception as e2:
-                logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
+            bio = await _download_image_async(url)
+            if bio:
+                try:
+                    await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
+                    return
+                except Exception as e2:
+                    logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 # --------------------- ПОЛЬЗОВАТЕЛИ (лист «Пользователи») ----
@@ -325,15 +392,19 @@ def load_users_from_sheet():
 
     return allowed, admins, blocked
 
-def ensure_users(force: bool = False):
-    """Кэшируем список пользователей из листа 'Пользователи' с TTL."""
+async def ensure_users_async(force: bool = False):
     global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
-    if force or (time.time() - _last_users_ts > USERS_TTL):
-        SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = load_users_from_sheet()
-        _last_users_ts = time.time()
-        logger.info(
-            f"👥 Пользователи: allowed={len(SHEET_ALLOWED)}, admins={len(SHEET_ADMINS)}, blocked={len(SHEET_BLOCKED)}"
-        )
+    if not force and (time.time() - _last_users_ts <= USERS_TTL):
+        return
+    allowed, admins, blocked = await _to_thread(load_users_from_sheet)
+    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
+    _last_users_ts = time.time()
+    logger.info(f"👥 Пользователи: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+
+def ensure_users(force: bool = False):
+    if not force and (time.time() - _last_users_ts <= USERS_TTL):
+        return
+    asyncio.create_task(ensure_users_async(force=True))
 
 def is_admin(uid: int) -> bool:
     ensure_users()
@@ -373,66 +444,69 @@ async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
 
 # --------------------- СОХРАНЕНИЕ СПИСАНИЙ -------------------
-def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
+def save_issue_to_sheet_blocking(bot, user, part: dict, quantity, comment: str):
     """
     Пишем в лист 'История' строго по его текущим заголовкам.
     Поддерживаем разные названия и порядок колонок.
     Ожидаемые ключи: Дата|ID|Имя|Тип|Наименование|Код|Количество|Коментарий/Комментарий/Comment
     """
+    client = get_gs_client()
+    sh = client.open_by_url(SPREADSHEET_URL)
     try:
-        client = get_gs_client()
-        sh = client.open_by_url(SPREADSHEET_URL)
-        try:
-            ws = sh.worksheet("История")
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title="История", rows=1000, cols=12)
-            ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
+        ws = sh.worksheet("История")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="История", rows=1000, cols=12)
+        ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
 
-        # Заголовки листа (как есть)
-        headers_raw = ws.row_values(1)
-        headers = [h.strip() for h in headers_raw]
-        norm = [h.lower() for h in headers]
+    # Заголовки листа (как есть)
+    headers_raw = ws.row_values(1)
+    headers = [h.strip() for h in headers_raw]
+    norm = [h.lower() for h in headers]
 
-        # Имя для печати
-        full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
-        display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
+    # Имя для печати
+    full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
+    display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
 
-        ts = now_local_str()  # локальное время по TIMEZONE
+    ts = now_local_str()  # локальное время по TIMEZONE
 
-        # Маппинг значений по нормализованным ключам
-        values_by_key = {
-            "дата": ts,
-            "timestamp": ts,
+    # Маппинг значений по нормализованным ключам
+    values_by_key = {
+        "дата": ts,
+        "timestamp": ts,
 
-            "id": user.id,
-            "user_id": user.id,
+        "id": user.id,
+        "user_id": user.id,
 
-            "имя": display_name,
-            "name": display_name,
+        "имя": display_name,
+        "name": display_name,
 
-            "тип": str(part.get("тип", "")),
-            "type": str(part.get("тип", "")),
+        "тип": str(part.get("тип", "")),
+        "type": str(part.get("тип", "")),
 
-            "наименование": str(part.get("наименование", "")),
-            "name_item": str(part.get("наименование", "")),
+        "наименование": str(part.get("наименование", "")),
+        "name_item": str(part.get("наименование", "")),
 
-            "код": str(part.get("код", "")),
-            "code": str(part.get("код", "")),
+        "код": str(part.get("код", "")),
+        "code": str(part.get("код", "")),
 
-            "количество": str(quantity),
-            "qty": str(quantity),
+        "数量": str(quantity),  # на всякий случай экзотика :)
+        "количество": str(quantity),
+        "qty": str(quantity),
 
-            # Комментарий — с одной/двумя «м», плюс английский
-            "коментарий": comment or "",
-            "комментарий": comment or "",
-            "comment": comment or "",
-        }
+        # Комментарий — с одной/двумя «м», плюс английский
+        "коментарий": comment or "",
+        "комментарий": comment or "",
+        "comment": comment or "",
+    }
 
-        # Строка по фактическому порядку колонок
-        row = [values_by_key.get(hn, "") for hn in norm]
+    # Строка по фактическому порядку колонок
+    row = [values_by_key.get(hn, "") for hn in norm]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    logger.info("💾 Списание записано в 'История' по текущим заголовкам")
 
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        logger.info("💾 Списание записано в 'История' по текущим заголовкам")
+async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
+    try:
+        await _to_thread(save_issue_to_sheet_blocking, bot, user, part, quantity, comment)
     except Exception as e:
         logger.error(f"Ошибка записи списания: {e}")
         async def notify():
@@ -448,7 +522,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
     await update.message.reply_text(
-        "Привет! Напиши запрос (например:По наименованию `ПОДШЛЕМНИК` или по типу детали `PI 8808 DRG 500`).\n"
+        "Привет! Напиши запрос: по наименованию (например, `ПОДШЛЕМНИК`) "
+        "или по типу/коду (например, `PI 8808 DRG 500` или слитно `PI8808DRG500`).\n\n"
         "Команды:\n"
         "• /help — помощь\n"
         "• /more — показать ещё\n"
@@ -461,9 +536,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "1) Выполните поиск по названию/модели/коду.\n"
-        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий, "
-        "а затем попросит подтвердить списание (Да/Нет).\n"
-        " У ВАС ВСЕ ПОЛУЧИТСЯ.",
+        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий,\n"
+        "   затем попросит подтвердить списание (Да/Нет).\n"
+        "У ВАС ВСЕ ПОЛУЧИТСЯ.",
         parse_mode="Markdown"
     )
 
@@ -473,7 +548,7 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Доступ запрещён.")
     ensure_fresh_data(force=True)
     ensure_users(force=True)
-    await update.message.reply_text("✅ Данные и пользователи перезагружены.")
+    await update.message.reply_text("✅ Данные и пользователи перезагружены (в фоне).")
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -491,15 +566,26 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
     try:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            results.to_excel(w, index=False)
-        buf.seek(0)
+        # пробуем XLSX
+        try:
+            import openpyxl  # noqa: F401
+        except Exception:
+            raise RuntimeError("openpyxl отсутствует")
+        buf = await _to_thread(_df_to_xlsx, results, f"export_{uid}.xlsx")
         await update.message.reply_document(InputFile(buf, filename=f"export_{uid}.xlsx"))
     except Exception as e:
-        logger.warning(f"Не удалось XLSX, шлём CSV: {e}")
+        logger.warning(f"Не удалось XLSX (fallback CSV): {e}")
         csv = results.to_csv(index=False, encoding="utf-8-sig")
-        await update.message.reply_document(InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv"))
+        await update.message.reply_document(
+            InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv")
+        )
+
+def _df_to_xlsx(df: DataFrame, name: str) -> BytesIO:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    buf.seek(0); buf.name = name
+    return buf
 
 # ------------------------- ПОИСК -----------------------------
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]  # image НЕ ищем
@@ -549,12 +635,16 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tokens = normalize(q).split()
     if not tokens:
         return await update.message.reply_text("Введите более конкретный запрос.")
-    q_squash = squash(q)  # НОВОЕ: слитная версия запроса
+    q_squash = squash(q)
+
+    # гарантируем, что данные есть (если только что обновились в фоне)
+    if df is None:
+        await ensure_fresh_data_async(force=True)
 
     matches = []
-    for _, row in df.iterrows():
+    for _, row in (df or DataFrame()).iterrows():
         rd = row.to_dict()
-        s = match_row(rd, tokens, q_squash)  # передаём q_squash
+        s = match_row(rd, tokens, q_squash)
         if s > 0:
             matches.append((s, rd))
 
@@ -588,17 +678,18 @@ async def send_page(update: Update, uid: int):
     page = st["page"]
 
     total = len(results)
-    pages = math.ceil(total / PAGE_SIZE)
+    if total == 0:
+        return await update.message.reply_text("Результатов больше нет.")
+    pages = max(1, math.ceil(total / PAGE_SIZE))
     if page >= pages:
         st["page"] = pages - 1
         return await update.message.reply_text("Больше результатов нет.")
 
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, total)
-    chunk = results.iloc[start:end]
 
-    await update.message.reply_text(f"Найдено: {total}. Показываю {start + 1}–{end} из {total}.")
-    for _, row in chunk.iterrows():
+    await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
+    for _, row in results.iloc[start:end].iterrows():
         await send_row_with_image(update, row.to_dict(), format_row(row.to_dict()))
     if end < total:
         await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
@@ -608,13 +699,15 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
     results: DataFrame = st["results"]
     page = st["page"]
     total = len(results)
-    pages = math.ceil(total / PAGE_SIZE)
+    if total == 0:
+        return await bot.send_message(chat_id=chat_id, text="Результатов больше нет.")
+    pages = max(1, math.ceil(total / PAGE_SIZE))
     if page >= pages:
         st["page"] = pages - 1
         return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, total)
-    await bot.send_message(chat_id=chat_id, text=f"Показываю {start + 1}–{end} из {total}.")
+    await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
     chunk = results.iloc[start:end]
     for _, row in chunk.iterrows():
         await send_row_with_image_bot(bot, chat_id, row.to_dict(), format_row(row.to_dict()))
@@ -650,10 +743,14 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip().replace(",", ".")
     try:
         qty = float(text)
-        if qty <= 0:
+        if not math.isfinite(qty) or qty <= 0 or qty > MAX_QTY:
             raise ValueError
+        qty = float(f"{qty:.3f}")  # аккурат до 3 знаков
     except Exception:
-        return await update.message.reply_text("Введите положительное число, например: 1 или 2.5", reply_markup=cancel_markup())
+        return await update.message.reply_text(
+            f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
+            reply_markup=cancel_markup()
+        )
 
     st = issue_state.get(uid)
     if not st or "part" not in st:
@@ -706,7 +803,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty = st["quantity"]
         comment = st.get("comment", "")
 
-        save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
+        await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
 
         issue_state.pop(uid, None)   # user_state НЕ трогаем
 
@@ -819,8 +916,12 @@ def build_app():
 
 if __name__ == "__main__":
     logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
-    ensure_fresh_data(force=True)
-    ensure_users(force=True)
+    if not WEBHOOK_SECRET_TOKEN:
+        logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется включить для продакшена.")
+
+    # Первичная блокирующая загрузка (безопасно до старта bot loop)
+    initial_load()
+
     application = build_app()
 
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
