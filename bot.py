@@ -73,7 +73,7 @@ _last_users_ts = 0.0
 user_state: Dict[int, Dict[str, Any]] = {}
 issue_state: Dict[int, Dict[str, Any]] = {}
 
-# флаги фоновых задач (защита от дублирования)
+# флаги фоновых задач
 _loading_data = False
 _loading_users = False
 
@@ -121,19 +121,20 @@ def load_data_blocking() -> list[dict]:
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
 
 def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
-    """Построение инвертированного индекса для быстрого поиска."""
+    """Инвертированный индекс: токен -> множество индексов строк."""
     index: DefaultDict[str, Set[int]] = defaultdict(set)
     for col in SEARCH_FIELDS:
         if col not in df.columns:
             continue
+        # .items() безопасно с pandas 2.x
         for idx, val in df[col].astype(str).str.lower().items():
-            tokens = re.findall(r'\w+', val)
-            for t in tokens:
-                index[t].add(idx)
+            for t in re.findall(r'\w+', val):
+                if t:
+                    index[t].add(idx)
     return dict(index)
 
 def build_image_index(df: DataFrame) -> Dict[str, str]:
-    """Индекс изображений по коду (сырые URL без сетевых запросов)."""
+    """'код' -> сырой URL (без сетевых запросов)."""
     if "image" not in df.columns:
         return {}
     index = {}
@@ -142,7 +143,7 @@ def build_image_index(df: DataFrame) -> Dict[str, str]:
         if code:
             url = str(row.get("image", "")).strip()
             if url:
-                index[code] = url  # сырой URL, без resolve
+                index[code] = url
     return index
 
 def initial_load():
@@ -411,7 +412,7 @@ def is_allowed(uid: int) -> bool:
     if uid in SHEET_BLOCKED:
         return False
     if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADМINS) or (uid in ADMINS)
+        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
     return True
 
 # --------------------- ГВАРДЫ -----------------------
@@ -549,6 +550,7 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
 
 # ------------------------- ПОИСК -----------------------------
 def match_row_by_index(tokens: List[str]) -> Set[int]:
+    """Точный быстрый матч по индексу (все токены как слова)."""
     if not _search_index:
         return set()
     result = None
@@ -558,7 +560,32 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
             result = indices.copy()
         else:
             result &= indices
+        if not result:
+            break
     return result or set()
+
+def _safe_col(df: DataFrame, col: str) -> Optional[pd.Series]:
+    return df[col].astype(str).str.lower() if col in df.columns else None
+
+def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
+    """Лёгкий скоринг релевантности: точные токены > подстроки; boost код/oem; слитный матч."""
+    score = 0
+    for f in SEARCH_FIELDS:
+        val = str(row.get(f, "")).lower()
+        if not val:
+            continue
+        # точный токен в поле
+        words = set(re.findall(r'\w+', val))
+        tok_hit = sum(1 for t in tokens if t in words)
+        # подстрока
+        sub_hit = sum(1 for t in tokens if t and t in val)
+        # слитный
+        sq = re.sub(r'[\W_]+', '', val)
+        squash_hit = 1 if q_squash and q_squash in sq else 0
+
+        weight = 2 if f in ("код", "oem") else 1
+        score += weight * (2 * tok_hit + sub_hit) + 3 * squash_hit * weight
+    return score
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
@@ -595,19 +622,56 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if df is None:
             return await update.message.reply_text("Ошибка загрузки данных.")
 
-    # Поиск через индекс
+    # 1) быстрый точный индекс
     matched_indices = match_row_by_index(tokens)
 
-    # fallback: «слитный» поиск по коду (если колонка есть)
-    if not matched_indices and q_squash and "код" in df.columns:
-        matched_indices = set(df[df["код"].astype(str).str.contains(q_squash, case=False, na=False)].index)
+    # 2) подстроки по любому полю (все токены должны встретиться в одном поле)
+    if not matched_indices:
+        mask_any = pd.Series(False, index=df.index)
+        for col in SEARCH_FIELDS:
+            series = _safe_col(df, col)
+            if series is None:
+                continue
+            field_mask = pd.Series(True, index=df.index)
+            for t in tokens:
+                if t:
+                    field_mask &= series.str.contains(re.escape(t), na=False)
+            mask_any |= field_mask
+        matched_indices = set(df.index[mask_any])
+
+    # 3) «слитный» фолбэк по всем полям
+    if not matched_indices and q_squash:
+        mask_any = pd.Series(False, index=df.index)
+        for col in SEARCH_FIELDS:
+            series = _safe_col(df, col)
+            if series is None:
+                continue
+            series_sq = series.str.replace(r'[\W_]+', '', regex=True)
+            mask_any |= series_sq.str.contains(re.escape(q_squash), na=False)
+        matched_indices = set(df.index[mask_any])
 
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
-    results_df = df.loc[list(matched_indices)].copy()
+    # Формируем результат + ранжируем по релевантности (легкий скоринг)
+    idx_list = list(matched_indices)
+    results_df = df.loc[idx_list].copy()
+
+    # считаем скор только по найденным строкам (быстро)
+    scores: List[int] = []
+    for _, r in results_df.iterrows():
+        scores.append(_relevance_score(r.to_dict(), tokens, q_squash))
+    results_df["__score"] = scores
+    # короткий код при прочих равных наверх
     if "код" in results_df.columns:
-        results_df = results_df.sort_values(by=["код"], key=lambda x: x.astype(str).str.len(), ascending=True)
+        results_df = results_df.sort_values(
+            by=["__score", "код"],
+            ascending=[False, True],
+            key=lambda s: s if s.name != "код" else s.astype(str).str.len()
+        )
+    else:
+        results_df = results_df.sort_values(by=["__score"], ascending=False)
+    results_df = results_df.drop(columns="__score")
 
     st = user_state.setdefault(uid, {})
     st["query"] = q
@@ -842,6 +906,10 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
+        # Явно фиксируем per_* чтобы убрать предупреждение и контролировать поведение
+        per_chat=True,
+        per_user=True,
+        per_message=False,
     )
     app.add_handler(conv)
 
