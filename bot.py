@@ -6,13 +6,12 @@ import json
 import math
 import time
 import asyncio
-import logging
 from datetime import datetime
-from io import BytesIO
-from zoneinfo import ZoneInfo  # локальное время для Истории
-from typing import Optional
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, Set, List, DefaultDict
+from collections import defaultdict
 
-import requests
+import aiohttp
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
@@ -26,66 +25,60 @@ from telegram.ext import (
 )
 
 # --------------------------- ЛОГИ ---------------------------
+import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
 
 # -------------------------- НАСТРОЙКИ -----------------------
-ADMINS = {225177765}  # локальные админы (добавка к листу)
+ADMINS = {225177765}  # локальные админы
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
-
-# имя листа с данными; если не найден — fallback на sheet1
 SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
-
-# Бизнес-лимит списания
 MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
-
-# Часовой пояс для записи в Историю
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+PAGE_SIZE = 5
+
+if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
+    raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # ✅ исправлено
+DATA_TTL = 300
+USERS_TTL = 300
+
 def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     try:
         return datetime.now(ZoneInfo(TZ_NAME)).strftime(fmt)
     except Exception:
         return datetime.utcnow().strftime(fmt)
 
-if not TELEGRAM_TOKEN or not SPREADSHEET_URL or not CREDS_JSON or not WEBHOOK_URL:
-    raise RuntimeError(
-        "ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL"
-    )
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DATA_TTL = 300          # TTL для данных
-USERS_TTL = 300         # TTL для листа «Пользователи»
-PAGE_SIZE = 5
-
-# шаги диалога
-ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
-
 # ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
 df: Optional[DataFrame] = None
 _last_load_ts = 0.0
+_search_index: Optional[Dict[str, Set[int]]] = None
+_image_index: Optional[Dict[str, str]] = None
 
-# пользователи из листа
-SHEET_ALLOWED: set[int] = set()
-SHEET_ADMINS: set[int] = set()
-SHEET_BLOCKED: set[int] = set()
+# пользователи
+SHEET_ALLOWED: Set[int] = set()
+SHEET_ADMINS: Set[int] = set()
+SHEET_BLOCKED: Set[int] = set()
 _last_users_ts = 0.0
 
-# состояние поиска/выдачи результатов
-user_state: dict[int, dict] = {}   # { user_id: { "query": str, "results": DataFrame, "page": int } }
+# состояние поиска и списания
+user_state: Dict[int, Dict[str, Any]] = {}
+issue_state: Dict[int, Dict[str, Any]] = {}
 
-def get_user_state(user_id: int) -> dict:
-    return user_state.setdefault(user_id, {"query": "", "results": DataFrame(), "page": 0})
+# флаги фоновых задач (защита от дублирования)
+_loading_data = False
+_loading_users = False
 
-# состояние операции списания
-issue_state: dict[int, dict] = {}  # { user_id: {"part": dict, "quantity": float, "comment": str, "await_comment": bool} }
+# шаги диалога
+ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ------------------------- КНОПКИ ---------------------------
 def cancel_markup():
@@ -93,17 +86,15 @@ def cancel_markup():
 
 def confirm_markup():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Да, списать", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ Нет", callback_data="confirm_no"),
-        ],
+        [InlineKeyboardButton("✅ Да, списать", callback_data="confirm_yes"),
+         InlineKeyboardButton("❌ Нет", callback_data="confirm_no")],
         [InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]
     ])
 
 def more_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
 
-# --------------------- ВСПОМОГАТЕЛЬНОЕ (IO → фон) ----------
+# ------------------------- ВСПОМОГАТЕЛЬНОЕ -------------------
 async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
@@ -127,46 +118,83 @@ def load_data_blocking() -> list[dict]:
     ws = _open_data_worksheet(client)
     return ws.get_all_records()
 
+SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
+
+def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
+    """Построение инвертированного индекса для быстрого поиска."""
+    index: DefaultDict[str, Set[int]] = defaultdict(set)
+    for col in SEARCH_FIELDS:
+        if col not in df.columns:
+            continue
+        for idx, val in df[col].astype(str).str.lower().items():
+            tokens = re.findall(r'\w+', val)
+            for t in tokens:
+                index[t].add(idx)
+    return dict(index)
+
+def build_image_index(df: DataFrame) -> Dict[str, str]:
+    """Построение индекса изображений по коду."""
+    if "image" not in df.columns:
+        return {}
+    index = {}
+    for _, row in df.iterrows():
+        code = str(row.get("код", "")).strip().lower()
+        if code:
+            url = str(row["image"]).strip()
+            if url:
+                index[code] = resolve_image_url(url)
+    return index
+
 def initial_load():
-    """Блокирующая первичная загрузка при старте — можно, т.к. делается один раз."""
-    global df, _last_load_ts, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
+    global df, _last_load_ts, _search_index, _image_index
     data = load_data_blocking()
     new_df = DataFrame(data)
     new_df.columns = new_df.columns.str.strip().str.lower()
+
     for col in ("код", "oem"):
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).str.strip().str.lower()
     if "image" in new_df.columns:
         new_df["image"] = new_df["image"].astype(str).str.strip()
-    df = new_df
-    _last_load_ts = time.time()
-    logger.info(f"✅ Загружено (startup) {len(df)} строк из Google Sheet")
 
-    # пользователи
+    df = new_df
+    _search_index = build_search_index(df)
+    _image_index = build_image_index(df)
+    _last_load_ts = time.time()
+    logger.info(f"✅ Загружено (startup) {len(df)} строк и индексы")
+
     allowed, admins, blocked = load_users_from_sheet()
+    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
     SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
     _last_users_ts = time.time()
     logger.info(f"👥 Пользователи (startup): allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
 
 async def ensure_fresh_data_async(force: bool = False):
-    global df, _last_load_ts
+    global df, _last_load_ts, _search_index, _image_index, _loading_data
     if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
         return
-    data = await _to_thread(load_data_blocking)
-    new_df = DataFrame(data)
-    new_df.columns = new_df.columns.str.strip().str.lower()
-    for col in ("код", "oem"):
-        if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
-    if "image" in new_df.columns:
-        new_df["image"] = new_df["image"].astype(str).str.strip()
-    df = new_df
-    _last_load_ts = time.time()
-    logger.info(f"✅ Загружено {len(df)} строк из Google Sheet (async)")
+    if _loading_data:
+        return
+    _loading_data = True
+    try:
+        data = await _to_thread(load_data_blocking)
+        new_df = DataFrame(data)
+        new_df.columns = new_df.columns.str.strip().str.lower()
+        for col in ("код", "oem"):
+            if col in new_df.columns:
+                new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+        if "image" in new_df.columns:
+            new_df["image"] = new_df["image"].astype(str).str.strip()
+
+        df = new_df
+        _search_index = build_search_index(df)
+        _image_index = build_image_index(df)
+        _last_load_ts = time.time()
+        logger.info(f"✅ Перезагружено {len(df)} строк и индексы")
+    finally:
+        _loading_data = False
 
 def ensure_fresh_data(force: bool = False):
-    """Мгновенный возврат + фоновая перезагрузка при необходимости."""
-    global df, _last_load_ts
     if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
         return
     asyncio.create_task(ensure_fresh_data_async(force=True))
@@ -174,13 +202,8 @@ def ensure_fresh_data(force: bool = False):
 # ------------------------- УТИЛИТЫ --------------------------
 def val(row: dict, key: str, default: str = "—") -> str:
     v = row.get(key)
-    if v is None:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
-    try:
-        if isinstance(v, float) and pd.isna(v):
-            return default
-    except Exception:
-        pass
     s = str(v).strip()
     return s if s else default
 
@@ -195,12 +218,10 @@ def format_row(row: dict) -> str:
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
-# --- нормализация для «слитного» поиска ---
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
 
 def squash(text: str) -> str:
-    # убираем все не-буквенно-цифровые символы и подчёркивания → "PI8808DRG500"
     return re.sub(r"[\W_]+", "", (text or "").lower(), flags=re.UNICODE)
 
 # ---------- Работа со ссылками на изображения ----------
@@ -212,7 +233,6 @@ def normalize_drive_url(url: str) -> str:
     return url
 
 def resolve_ibb_direct(url: str) -> str:
-    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...)."""
     try:
         resp = requests.get(url, timeout=12)
         resp.raise_for_status()
@@ -234,66 +254,34 @@ def resolve_image_url(u: str) -> str:
         return resolve_ibb_direct(u)
     return u
 
-def find_image_by_code(code: str) -> str:
-    """
-    Ищем ссылку на фото по КОДУ в столбце image (по всему листу).
-    1) Токен-совпадение в URL/имени файла (/, _, -, или расширение .png/.jpg и т.п.).
-    2) Фолбэк: простое contains (case-insensitive).
-    """
-    if df is None or "image" not in df.columns:
+async def find_image_by_code_async(code: str) -> str:
+    if not code or _image_index is None:
         return ""
-    code_raw = (code or "").strip()
-    if not code_raw:
-        return ""
+    return _image_index.get(code.strip().lower(), "")
 
-    col = df["image"].astype(str)
-
-    # 1) «почти точное» совпадение кода как токена
-    pat = r'(?i)(?:^|[\/_\-])' + re.escape(code_raw) + r'(?:\.[a-z0-9]{2,5}(?:\?.*)?$|[\/_\-?#])'
-    mask_token = col.str.contains(pat, regex=True, na=False)
-    if mask_token.any():
-        url = str(col[mask_token].iloc[0]).strip()
-        return resolve_image_url(url)
-
-    # 2) Фолбэк: простое вхождение кода
-    mask_contains = col.str.contains(re.escape(code_raw), case=False, na=False)
-    if mask_contains.any():
-        url = str(col[mask_contains].iloc[0]).strip()
-        return resolve_image_url(url)
-
-    return ""
-
-def _download_image(url: str, timeout: int = 12, max_bytes: int = 5_000_000) -> Optional[BytesIO]:
-    r = requests.get(url, timeout=timeout, stream=True, allow_redirects=True)
-    r.raise_for_status()
-    total = 0
-    bio = BytesIO()
-    for chunk in r.iter_content(8192):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > max_bytes:
-            raise RuntimeError("Image too large")
-        bio.write(chunk)
-    bio.seek(0)
-    bio.name = "image"
-    return bio
-
-async def _download_image_async(url: str) -> Optional[BytesIO]:
+async def _download_image_async(url: str) -> Optional[io.BytesIO]:
     try:
-        return await _to_thread(_download_image, url)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                if len(data) > 5_000_000:
+                    return None
+                bio = io.BytesIO(data)
+                bio.name = "image"
+                return bio
     except Exception as e:
-        logger.warning(f"_download_image_async fail: {e}")
+        logger.warning(f"Download failed: {e}")
         return None
 
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
-    url = find_image_by_code(code)
+    url = await find_image_by_code_async(code)
 
     if url:
         try:
-            # Телеграм сам скачает URL (не блокирует наш event-loop)
             await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
             return
         except Exception as e:
@@ -311,7 +299,7 @@ async def send_row_with_image(update: Update, row: dict, text: str):
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
-    url = find_image_by_code(code)
+    url = await find_image_by_code_async(code)
     if url:
         try:
             await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
@@ -327,7 +315,7 @@ async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
                     logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
-# --------------------- ПОЛЬЗОВАТЕЛИ (лист «Пользователи») ----
+# --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
 def _truthy(x) -> bool:
     s = str(x).strip().lower()
     return s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок", "allowed", "разрешен", "разрешено"} or (s.isdigit() and int(s) > 0)
@@ -345,7 +333,6 @@ def _to_int_or_none(x):
         return None
 
 def load_users_from_sheet():
-    """Читает лист 'Пользователи' (или 'Users') и возвращает три сета: allowed, admins, blocked."""
     client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
     try:
@@ -354,16 +341,15 @@ def load_users_from_sheet():
         try:
             ws = sh.worksheet("Users")
         except gspread.WorksheetNotFound:
-            logger.info("Лист 'Пользователи' не найден — ограничение по юзерам отключено (разрешаем всем).")
+            logger.info("Лист 'Пользователи' не найден — доступ разрешён всем.")
             return set(), set(), set()
 
     rows = ws.get_all_records()
     if not rows:
-        logger.info("Лист 'Пользователи' пуст — ограничение по юзерам отключено (разрешаем всем).")
+        logger.info("Лист 'Пользователи' пуст — доступ разрешён всем.")
         return set(), set(), set()
 
     allowed, admins, blocked = set(), set(), set()
-
     for row in rows:
         r = {str(k).strip().lower(): v for k, v in row.items()}
         uid = (
@@ -378,28 +364,34 @@ def load_users_from_sheet():
             continue
 
         role = str(r.get("role") or r.get("роль") or "").strip().lower()
-        is_admin_flag = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
-        is_allowed_flag = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
-        is_blocked_flag = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
+        is_admin = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
+        is_allowed = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
+        is_blocked = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
 
-        if is_blocked_flag:
+        if is_blocked:
             blocked.add(uid)
-        if is_admin_flag:
+        if is_admin:
             admins.add(uid)
-            is_allowed_flag = True  # админ всегда разрешён
-        if is_allowed_flag:
+            is_allowed = True
+        if is_allowed:
             allowed.add(uid)
 
     return allowed, admins, blocked
 
 async def ensure_users_async(force: bool = False):
-    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
+    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts, _loading_users
     if not force and (time.time() - _last_users_ts <= USERS_TTL):
         return
-    allowed, admins, blocked = await _to_thread(load_users_from_sheet)
-    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
-    _last_users_ts = time.time()
-    logger.info(f"👥 Пользователи: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    if _loading_users:
+        return
+    _loading_users = True
+    try:
+        allowed, admins, blocked = await _to_thread(load_users_from_sheet)
+        SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
+        _last_users_ts = time.time()
+        logger.info(f"👥 Пользователи: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    finally:
+        _loading_users = False
 
 def ensure_users(force: bool = False):
     if not force and (time.time() - _last_users_ts <= USERS_TTL):
@@ -411,12 +403,6 @@ def is_admin(uid: int) -> bool:
     return uid in SHEET_ADMINS or uid in ADMINS
 
 def is_allowed(uid: int) -> bool:
-    """
-    Логика:
-    - если лист пуст/нет — разрешаем всем (как сейчас);
-    - если есть allowed — whitelist: только allowed или админ;
-    - blocked всегда запрещён.
-    """
     ensure_users()
     if uid in SHEET_BLOCKED:
         return False
@@ -424,7 +410,7 @@ def is_allowed(uid: int) -> bool:
         return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
     return True
 
-# --------------------- ГВАРДЫ ДО ВСЕГО -----------------------
+# --------------------- ГВАРДЫ -----------------------
 async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user and not is_allowed(user.id):
@@ -445,11 +431,6 @@ async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- СОХРАНЕНИЕ СПИСАНИЙ -------------------
 def save_issue_to_sheet_blocking(bot, user, part: dict, quantity, comment: str):
-    """
-    Пишем в лист 'История' строго по его текущим заголовкам.
-    Поддерживаем разные названия и порядок колонок.
-    Ожидаемые ключи: Дата|ID|Имя|Тип|Наименование|Код|Количество|Коментарий/Комментарий/Comment
-    """
     client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
     try:
@@ -458,51 +439,28 @@ def save_issue_to_sheet_blocking(bot, user, part: dict, quantity, comment: str):
         ws = sh.add_worksheet(title="История", rows=1000, cols=12)
         ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
 
-    # Заголовки листа (как есть)
     headers_raw = ws.row_values(1)
     headers = [h.strip() for h in headers_raw]
     norm = [h.lower() for h in headers]
 
-    # Имя для печати
     full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
     display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
+    ts = now_local_str()
 
-    ts = now_local_str()  # локальное время по TIMEZONE
-
-    # Маппинг значений по нормализованным ключам
     values_by_key = {
-        "дата": ts,
-        "timestamp": ts,
-
-        "id": user.id,
-        "user_id": user.id,
-
-        "имя": display_name,
-        "name": display_name,
-
-        "тип": str(part.get("тип", "")),
-        "type": str(part.get("тип", "")),
-
-        "наименование": str(part.get("наименование", "")),
-        "name_item": str(part.get("наименование", "")),
-
-        "код": str(part.get("код", "")),
-        "code": str(part.get("код", "")),
-
-        "数量": str(quantity),  # на всякий случай экзотика :)
-        "количество": str(quantity),
-        "qty": str(quantity),
-
-        # Комментарий — с одной/двумя «м», плюс английский
-        "коментарий": comment or "",
-        "комментарий": comment or "",
-        "comment": comment or "",
+        "дата": ts, "timestamp": ts,
+        "id": user.id, "user_id": user.id,
+        "имя": display_name, "name": display_name,
+        "тип": str(part.get("тип", "")), "type": str(part.get("тип", "")),
+        "наименование": str(part.get("наименование", "")), "name_item": str(part.get("наименование", "")),
+        "код": str(part.get("код", "")), "code": str(part.get("код", "")),
+        "数量": str(quantity), "количество": str(quantity), "qty": str(quantity),
+        "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
     }
 
-    # Строка по фактическому порядку колонок
     row = [values_by_key.get(hn, "") for hn in norm]
     ws.append_row(row, value_input_option="USER_ENTERED")
-    logger.info("💾 Списание записано в 'История' по текущим заголовкам")
+    logger.info("💾 Списание записано в 'История'")
 
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     try:
@@ -521,6 +479,7 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     issue_state.pop(uid, None)
+    user_state.pop(uid, None)
     await update.message.reply_text(
         "Привет! Напиши запрос: по наименованию (например, `ПОДШЛЕМНИК`) "
         "или по типу/коду (например, `PI 8808 DRG 500` или слитно `PI8808DRG500`).\n\n"
@@ -528,7 +487,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /help — помощь\n"
         "• /more — показать ещё\n"
         "• /export — выгрузка результатов (XLSX/CSV)\n"
-        "• /cancel — отменить списание (или кнопкой «Отменить»)\n"
+        "• /cancel — отменить списание\n"
         "• /reload — перезагрузить данные и пользователей (только админ)",
         parse_mode="Markdown"
     )
@@ -559,53 +518,43 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    st = get_user_state(uid)
-    results = st.get("results")
-    if not isinstance(results, DataFrame):
-        results = DataFrame()
+    st = user_state.get(uid, {})
+    results = st.get("results", DataFrame())
     if results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        # пробуем XLSX
-        try:
-            import openpyxl  # noqa: F401
-        except Exception:
-            raise RuntimeError("openpyxl отсутствует")
-        buf = await _to_thread(_df_to_xlsx, results, f"export_{uid}.xlsx")
-        await update.message.reply_document(InputFile(buf, filename=f"export_{uid}.xlsx"))
+        import openpyxl
+        buf = await _to_thread(_df_to_xlsx, results, f"export_{timestamp}.xlsx")
+        await update.message.reply_document(InputFile(buf, filename=f"export_{timestamp}.xlsx"))
     except Exception as e:
         logger.warning(f"Не удалось XLSX (fallback CSV): {e}")
         csv = results.to_csv(index=False, encoding="utf-8-sig")
         await update.message.reply_document(
-            InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{uid}.csv")
+            InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{timestamp}.csv")
         )
 
-def _df_to_xlsx(df: DataFrame, name: str) -> BytesIO:
+def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
-    buf.seek(0); buf.name = name
+    buf.seek(0)
+    buf.name = name
     return buf
 
 # ------------------------- ПОИСК -----------------------------
-SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]  # image НЕ ищем
-
-def match_row(row: dict, tokens: list[str], q_squash: str) -> int:
-    score = 0
-    for f in SEARCH_FIELDS:
-        raw = str(row.get(f, ""))
-        val_norm = normalize(raw)
-        val_squash = squash(raw)
-
-        # классический матч по токенам
-        if val_norm and all(t in val_norm for t in tokens):
-            score += 2 if f in ("код", "oem") else 1
-            continue
-
-        # слитный запрос (PI8808DRG500) против строк с пробелами/дефисами (PI 8808 DRG 500)
-        if q_squash and q_squash in val_squash:
-            score += 2 if f in ("код", "oem") else 1
-    return score
+def match_row_by_index(tokens: List[str]) -> Set[int]:
+    if not _search_index:
+        return set()
+    result = None
+    for t in tokens:
+        indices = _search_index.get(t, set())
+        if result is None:
+            result = indices.copy()
+        else:
+            result &= indices
+    return result or set()
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
@@ -637,24 +586,24 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Введите более конкретный запрос.")
     q_squash = squash(q)
 
-    # гарантируем, что данные есть (если только что обновились в фоне)
     if df is None:
         await ensure_fresh_data_async(force=True)
+        if df is None:
+            return await update.message.reply_text("Ошибка загрузки данных.")
 
-    matches = []
-    for _, row in (df or DataFrame()).iterrows():
-        rd = row.to_dict()
-        s = match_row(rd, tokens, q_squash)
-        if s > 0:
-            matches.append((s, rd))
+    # Поиск через индекс
+    matched_indices = match_row_by_index(tokens)
+    if not matched_indices and q_squash:
+        # fallback: поиск по слитному коду
+        matched_indices = set(df[df["код"].str.contains(q_squash, case=False, na=False)].index)
 
-    if not matches:
+    if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
-    matches.sort(key=lambda x: x[0], reverse=True)
-    results_df = DataFrame([r for _, r in matches])
+    results_df = df.loc[list(matched_indices)].copy()
+    results_df = results_df.sort_values(by=["код"], key=lambda x: x.str.len(), ascending=True)
 
-    st = get_user_state(uid)
+    st = user_state.setdefault(uid, {})
     st["query"] = q
     st["results"] = results_df
     st["page"] = 0
@@ -663,19 +612,17 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    st = get_user_state(uid)
-    results = st.get("results")
-    if not isinstance(results, DataFrame):
-        results = DataFrame()
+    st = user_state.get(uid, {})
+    results = st.get("results", DataFrame())
     if results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
-    st["page"] += 1
+    st["page"] = st.get("page", 0) + 1
     await send_page(update, uid)
 
 async def send_page(update: Update, uid: int):
-    st = get_user_state(uid)
-    results: DataFrame = st["results"]
-    page = st["page"]
+    st = user_state.get(uid, {})
+    results: DataFrame = st.get("results", DataFrame())
+    page = st.get("page", 0)
 
     total = len(results)
     if total == 0:
@@ -695,9 +642,9 @@ async def send_page(update: Update, uid: int):
         await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
 
 async def send_page_via_bot(bot, chat_id: int, uid: int):
-    st = get_user_state(uid)
-    results: DataFrame = st["results"]
-    page = st["page"]
+    st = user_state.get(uid, {})
+    results: DataFrame = st.get("results", DataFrame())
+    page = st.get("page", 0)
     total = len(results)
     if total == 0:
         return await bot.send_message(chat_id=chat_id, text="Результатов больше нет.")
@@ -725,7 +672,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
     found = None
     if df is not None and "код" in df.columns:
-        hit = df[df["код"].astype(str).str.lower() == code]
+        hit = df[df["код"] == code]
         if not hit.empty:
             found = hit.iloc[0].to_dict()
 
@@ -745,7 +692,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty = float(text)
         if not math.isfinite(qty) or qty <= 0 or qty > MAX_QTY:
             raise ValueError
-        qty = float(f"{qty:.3f}")  # аккурат до 3 знаков
+        qty = float(f"{qty:.3f}")
     except Exception:
         return await update.message.reply_text(
             f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
@@ -758,7 +705,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st["quantity"] = qty
     st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий Пример: (Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
+    await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -804,8 +751,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         comment = st.get("comment", "")
 
         await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
-
-        issue_state.pop(uid, None)   # user_state НЕ трогаем
+        issue_state.pop(uid, None)
 
         await q.message.reply_text(
             f"✅ Списано: {qty}\n"
@@ -824,11 +770,9 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-
-    if uid not in issue_state:
-        return
-    issue_state.pop(uid, None)
-    await q.message.reply_text("❌ Операция списания отменена.")
+    if uid in issue_state:
+        issue_state.pop(uid, None)
+        await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -839,13 +783,11 @@ async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    st = get_user_state(uid)
-    results = st.get("results")
-    if not isinstance(results, DataFrame):
-        results = DataFrame()
+    st = user_state.get(uid, {})
+    results = st.get("results", DataFrame())
     if results.empty:
         return await q.message.reply_text("Сначала выполните поиск.")
-    st["page"] += 1
+    st["page"] = st.get("page", 0) + 1
     chat_id = q.message.chat.id
     await send_page_via_bot(context.bot, chat_id, uid)
 
@@ -863,11 +805,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Гварды до любых хендлеров
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("more", more_cmd))
@@ -875,41 +815,31 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Кнопка «Ещё»
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
+    app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
-    # Диалог списания
     conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(on_issue_click, pattern=r"^issue:"),
-            CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
-        ],
+        entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
             ASK_QUANTITY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
             ],
             ASK_COMMENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
             ],
             ASK_CONFIRM: [
                 CallbackQueryHandler(handle_confirm, pattern=r"^confirm_(yes|no)$"),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
+                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
             ],
         },
-        fallbacks=[
-            CommandHandler("cancel", handle_cancel_in_dialog),
-            CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"),
-        ],
+        fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
         allow_reentry=True,
     )
     app.add_handler(conv)
 
-    # Поиск — в группе 1, чтобы диалог «съедал» апдейты первым
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
-
-    # Error handler
     app.add_error_handler(on_error)
 
     return app
@@ -919,9 +849,7 @@ if __name__ == "__main__":
     if not WEBHOOK_SECRET_TOKEN:
         logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется включить для продакшена.")
 
-    # Первичная блокирующая загрузка (безопасно до старта bot loop)
     initial_load()
-
     application = build_app()
 
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
