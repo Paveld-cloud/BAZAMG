@@ -47,7 +47,7 @@ PAGE_SIZE = 5
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # ✅ исправлено
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DATA_TTL = 300
 USERS_TTL = 300
 
@@ -133,16 +133,16 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
     return dict(index)
 
 def build_image_index(df: DataFrame) -> Dict[str, str]:
-    """Построение индекса изображений по коду."""
+    """Индекс изображений по коду (сырые URL без сетевых запросов)."""
     if "image" not in df.columns:
         return {}
     index = {}
     for _, row in df.iterrows():
         code = str(row.get("код", "")).strip().lower()
         if code:
-            url = str(row["image"]).strip()
+            url = str(row.get("image", "")).strip()
             if url:
-                index[code] = resolve_image_url(url)
+                index[code] = url  # сырой URL, без resolve
     return index
 
 def initial_load():
@@ -232,26 +232,28 @@ def normalize_drive_url(url: str) -> str:
         return f'https://drive.google.com/uc?export=download&id={file_id}'
     return url
 
-def resolve_ibb_direct(url: str) -> str:
+async def resolve_ibb_direct_async(url: str) -> str:
+    """Из ibb.co/* HTML-страницы достаём og:image (i.ibb.co/...) — асинхронно."""
     try:
-        resp = requests.get(url, timeout=12)
-        resp.raise_for_status()
-        html = resp.text
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    return url
+                html = await resp.text()
         m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if m:
-            return m.group(1)
+        return m.group(1) if m else url
     except Exception as e:
-        logger.warning(f"resolve_ibb_direct fail: {e}")
-    return url
+        logger.warning(f"resolve_ibb_direct_async fail: {e}")
+        return url
 
-def resolve_image_url(u: str) -> str:
+async def resolve_image_url_async(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return u
     if "drive.google.com" in u:
         return normalize_drive_url(u)
     if re.match(r"^https?://(www\.)?ibb\.co/", u, re.I):
-        return resolve_ibb_direct(u)
+        return await resolve_ibb_direct_async(u)
     return u
 
 async def find_image_by_code_async(code: str) -> str:
@@ -278,7 +280,8 @@ async def _download_image_async(url: str) -> Optional[io.BytesIO]:
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
-    url = await find_image_by_code_async(code)
+    url_raw = await find_image_by_code_async(code)
+    url = await resolve_image_url_async(url_raw)
 
     if url:
         try:
@@ -299,7 +302,8 @@ async def send_row_with_image(update: Update, row: dict, text: str):
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
-    url = await find_image_by_code_async(code)
+    url_raw = await find_image_by_code_async(code)
+    url = await resolve_image_url_async(url_raw)
     if url:
         try:
             await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
@@ -407,7 +411,7 @@ def is_allowed(uid: int) -> bool:
     if uid in SHEET_BLOCKED:
         return False
     if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
+        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADМINS) or (uid in ADMINS)
     return True
 
 # --------------------- ГВАРДЫ -----------------------
@@ -525,7 +529,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
         buf = await _to_thread(_df_to_xlsx, results, f"export_{timestamp}.xlsx")
         await update.message.reply_document(InputFile(buf, filename=f"export_{timestamp}.xlsx"))
     except Exception as e:
@@ -593,15 +597,17 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Поиск через индекс
     matched_indices = match_row_by_index(tokens)
-    if not matched_indices and q_squash:
-        # fallback: поиск по слитному коду
-        matched_indices = set(df[df["код"].str.contains(q_squash, case=False, na=False)].index)
+
+    # fallback: «слитный» поиск по коду (если колонка есть)
+    if not matched_indices and q_squash and "код" in df.columns:
+        matched_indices = set(df[df["код"].astype(str).str.contains(q_squash, case=False, na=False)].index)
 
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
     results_df = df.loc[list(matched_indices)].copy()
-    results_df = results_df.sort_values(by=["код"], key=lambda x: x.str.len(), ascending=True)
+    if "код" in results_df.columns:
+        results_df = results_df.sort_values(by=["код"], key=lambda x: x.astype(str).str.len(), ascending=True)
 
     st = user_state.setdefault(uid, {})
     st["query"] = q
@@ -672,7 +678,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_fresh_data()
     found = None
     if df is not None and "код" in df.columns:
-        hit = df[df["код"] == code]
+        hit = df[df["код"].astype(str).str.lower() == code]
         if not hit.empty:
             found = hit.iloc[0].to_dict()
 
