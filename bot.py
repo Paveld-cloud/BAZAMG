@@ -1,4 +1,4 @@
-# bot.py
+## bot.py
 import os
 import re
 import io
@@ -10,7 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
-from html import escape  # ✅ для безопасного HTML
+from html import escape  # безопасный HTML
 
 import aiohttp
 import gspread
@@ -45,10 +45,13 @@ MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
-# Приветствие
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # url или file_id
+# Приветствие / медиа
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id (если используешь видео/анимацию)
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id (если используешь ссылку/другой file_id)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
+
+# Твой file_id для фото приветствия (будет использован в первую очередь)
+WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
@@ -108,7 +111,9 @@ async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
-    """Отправка HTML с фолбэком в обычный текст, если парсер Телеграма ругнётся."""
+    """
+    Пытаемся отправить HTML. Если парсер Телеграма ругнётся — шлём как обычный текст без форматирования.
+    """
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
     except Exception as e:
@@ -499,10 +504,40 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
 async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    # Экранируем имя для HTML
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # Аккуратная карточка (только поддерживаемые теги)
+    # 1) Если есть анимация/видео — отправим (caption простой текст)
+    if WELCOME_ANIMATION_URL:
+        try:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=WELCOME_ANIMATION_URL,
+                caption=f"⚙️ Добро пожаловать, {first}!"
+            )
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Welcome animation failed: {e}")
+
+    # 2) Если задан твой file_id — отправим фото по нему
+    sent_media = False
+    if WELCOME_MEDIA_ID:
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, disable_notification=True)
+            sent_media = True
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Welcome photo by file_id failed: {e}")
+
+    # 3) Если не получилось/не задано — попробуем WELCOME_PHOTO_URL (URL или другой file_id)
+    if not sent_media and WELCOME_PHOTO_URL:
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
+            sent_media = True
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Welcome photo by URL/file_id failed: {e}")
+
+    # 4) Отдельным сообщением — «карточка» с HTML (безопасная отправка)
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
         f"<i>Инженерный бот для поиска и списания деталей</i>\n"
@@ -513,43 +548,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         f"Пример: <code>PI 8808 DRG 500</code>\n"
         f"Удачной работы! 🚀"
     )
-
-    # 1) Анимация (если задана)
-    if WELCOME_ANIMATION_URL:
-        try:
-            await context.bot.send_animation(
-                chat_id=chat_id,
-                animation=WELCOME_ANIMATION_URL,
-                caption=f"⚙️ <b>Добро пожаловать, {first}!</b>",
-                parse_mode="HTML",
-            )
-            await asyncio.sleep(0.35)
-        except Exception as e:
-            logger.warning(f"Welcome animation failed: {e}")
-
-    # 2) Фото с карточкой в подписи
-    if WELCOME_PHOTO_URL:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=WELCOME_PHOTO_URL,
-                caption=card_html,
-                parse_mode="HTML",
-                disable_notification=True,
-                reply_markup=main_menu_markup()
-            )
-            return
-        except Exception as e:
-            logger.warning(f"Welcome photo (HTML) failed: {e}")
-            # Фото без подписи, карточка отдельным сообщением (надёжный путь)
-            try:
-                await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
-            except Exception as e2:
-                logger.warning(f"Welcome photo (plain) failed too: {e2}")
-            await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
-            return
-
-    # 3) Фолбэк — просто карточка
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # ------------------------- КОМАНДЫ --------------------------
@@ -562,25 +560,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message:
         await asyncio.sleep(0.2)
-        await update.message.reply_text(
-            "Команды:\n"
-            "• /help — помощь\n"
-            "• /more — показать ещё\n"
-            "• /export — выгрузка результатов (XLSX/CSV)\n"
-            "• /cancel — отменить списание\n"
-            "• /reload — перезагрузка данных и пользователей (только админ)\n"
-            "• /fileid — режим получения file_id из отправленного медиа",
-            parse_mode="Markdown"
+        cmds_html = (
+            "<b>Команды</b>:\n"
+            "• <code>/help</code> — помощь\n"
+            "• <code>/more</code> — показать ещё\n"
+            "• <code>/export</code> — выгрузка результатов (XLSX/CSV)\n"
+            "• <code>/cancel</code> — отменить списание\n"
+            "• <code>/reload</code> — перезагрузка данных и пользователей (только админ)\n"
+            "• <code>/fileid</code> — получить <i>file_id</i> из присланного медиа\n"
         )
+        await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    msg = (
+        "<b>Как пользоваться</b>:\n"
         "1) Выполните поиск по названию/модели/коду.\n"
-        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий,\n"
-        "   затем попросит подтвердить списание (Да/Нет).\n"
-        "У ВАС ВСЕ ПОЛУЧИТСЯ.",
-        parse_mode="Markdown"
+        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий.\n"
+        "3) Подтвердите списание (Да/Нет).\n"
+        "<i>У вас всё получится!</i>"
     )
+    await _safe_send_html_message(context.bot, update.effective_chat.id, msg)
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -629,7 +628,7 @@ async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["await_fileid"] = True
     await update.message.reply_text(
         "Отправьте фото/видео/гиф — отвечу его file_id. "
-        "Потом вставьте его в WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL."
+        "Потом вставьте его в WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHOTO_URL."
     )
 
 async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -645,7 +644,7 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.video.file_id
         kind = "video"
     elif update.message.photo:
-        file_id = update.message.photo[-1].file_id
+        file_id = update.message.photo[-1].file_id  # самое крупное
         kind = "photo"
 
     if file_id:
@@ -654,7 +653,7 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.bot,
             update.effective_chat.id,
             f"✅ {kind} file_id:\n<code>{escape(file_id)}</code>\n\n"
-            f"Скопируйте в ENV: WELCOME_ANIMATION_URL или WELCOME_PHOTO_URL."
+            f"Скопируйте в ENV: WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHOTO_URL."
         )
     else:
         await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
@@ -663,19 +662,20 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text("🔍 Введите запрос: название/модель/код. Пример: `PI 8808 DRG 500`", parse_mode="Markdown")
+    msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text(
-        "Как списать деталь:\n"
+    msg = (
+        "<b>Как списать деталь</b>:\n"
         "1) Выполните поиск по названию/коду.\n"
         "2) В карточке нажмите «📦 Взять деталь».\n"
         "3) Укажите количество и комментарий.\n"
-        "4) Подтвердите списание кнопкой «Да».",
-        parse_mode="Markdown"
+        "4) Подтвердите списание кнопкой «Да»."
     )
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -900,6 +900,10 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st["await_comment"] = True
     await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return ASK_COMMENT
+
+async def handle_comment(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+    # опечатка: сигнатура должна быть (update, context)
+    pass  # этот заглушечный хендлер не используется; настоящий ниже
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
