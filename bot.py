@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
 from html import escape  # безопасный HTML
-from urllib.parse import urlparse, parse_qs  # ⬅️ для разбора имени файла из URL
+from urllib.parse import urlparse, parse_qs, unquote  # ⬅️ добавлен unquote
 
 import aiohttp
 import gspread
@@ -112,9 +112,6 @@ async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
-    """
-    Пытаемся отправить HTML. Если парсер Телеграма ругнётся — шлём как обычный текст без форматирования.
-    """
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
     except Exception as e:
@@ -156,32 +153,36 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
                     index[t].add(idx)
     return dict(index)
 
-# ================== КОД-ФИКС: нормализация кода ==================
+# ================== НОРМАЛИЗАЦИЯ КОДА ==================
 def _norm_code(c: str) -> tuple[str, str]:
     raw = (c or "").strip().lower()
     squash = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
     return raw, squash
 
-# ================== ПОМОЩНИКИ: имя файла из URL ==================
+# ================== ИМЯ ФАЙЛА ИЗ URL ==================
 def _filename_from_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return ""
     p = urlparse(u)
-    name = p.path.rsplit("/", 1)[-1]
+    name = unquote(p.path.rsplit("/", 1)[-1] or "")
     if not name or "." not in name:
         qnames = []
         for v in parse_qs(p.query).values():
             qnames.extend(v)
-        for cand in qnames + [p.fragment]:
-            if isinstance(cand, str) and "." in cand:
-                name = cand.rsplit("/", 1)[-1]
-                break
+        candidates = qnames + [p.fragment]
+        for cand in candidates:
+            if isinstance(cand, str):
+                cand = unquote(cand)
+                cand_name = cand.rsplit("/", 1)[-1]
+                if "." in cand_name:
+                    name = cand_name
+                    break
     return name
 
 def _tokens_from_filename(u: str) -> list[str]:
     """
-    Достаём токены из имени файла без расширения:
+    Извлекаем токены из basename (без расширения):
     'E218PXI-8808 DRG500.jpg' -> ['e218pxi8808drg500', 'e218pxi', '8808', 'drg500']
     """
     name = _filename_from_url(u)
@@ -194,16 +195,42 @@ def _tokens_from_filename(u: str) -> list[str]:
     seen, out = set(), []
     for t in [fused] + parts:
         if t and t not in seen:
-            seen.add(t)
-            out.append(t)
+            seen.add(t); out.append(t)
     return out
 
-# ================== КОД-ФИКС: индекс картинок (по имени файла) ==
+# ================== УТИЛЫ ДЛЯ ФОЛБЭКА ==================
+def _fuse(text: str) -> str:
+    return re.sub(r"[\W_]+", "", (text or "").lower(), flags=re.UNICODE)
+
+def _scan_images_by_code_fallback(code: str) -> str:
+    """
+    Последняя линия обороны: сканируем весь df['image'] и сверяем «слеплённый» код с «слеплённым» basename.
+    """
+    global df
+    if df is None or "image" not in df.columns:
+        return ""
+    sq = _fuse(code)
+    if not sq:
+        return ""
+    try:
+        for _, row in df.iterrows():
+            u = str(row.get("image", "")).strip()
+            if not u:
+                continue
+            base = _filename_from_url(u)
+            fused = _fuse(base.rsplit(".", 1)[0])
+            if fused and (sq in fused):
+                return u
+    except Exception:
+        pass
+    return ""
+
+# ================== ИНДЕКС КАРТИНОК (по имени файла) ==
 def build_image_index(df: DataFrame) -> Dict[str, str]:
     """
     Индексируем картинки по кодам, встречающимся в НАЗВАНИИ ФОТО (basename URL).
-    Ключи в индексе — нормализованные токены из имени файла (и их слеплённые варианты),
-    плюс сами значения 'код'/'oem', если они содержатся в имени файла.
+    Ключи — нормализованные токены из имени файла (и их слеплённые варианты),
+    плюс значения 'код'/'oem', если они содержатся в имени файла.
     """
     if "image" not in df.columns:
         return {}
@@ -215,7 +242,8 @@ def build_image_index(df: DataFrame) -> Dict[str, str]:
             continue
 
         tokens = _tokens_from_filename(url)  # токены из basename
-        # привязываем все токены
+
+        # привяжем все токены
         for t in tokens:
             rt, st = _norm_code(t)
             if rt:
@@ -223,7 +251,7 @@ def build_image_index(df: DataFrame) -> Dict[str, str]:
             if st and st != rt:
                 index.setdefault(st, url)
 
-        # если код присутствует в слеплённом имени — индексируем и им
+        # если 'код' встречается в слеплённом имени — индексируем и им
         code_val = str(row.get("код", "")).strip().lower()
         if code_val:
             raw, sq = _norm_code(code_val)
@@ -248,7 +276,7 @@ def build_image_index(df: DataFrame) -> Dict[str, str]:
                     index.setdefault(sq, url)
 
     return index
-# =================================================================
+# =============================================================
 
 def initial_load():
     global df, _last_load_ts, _search_index, _image_index
@@ -364,24 +392,28 @@ async def resolve_image_url_async(u: str) -> str:
 async def find_image_by_code_async(code: str) -> str:
     """
     Ищем фото по КОДУ в НАЗВАНИИ ФОТО.
-    Сначала точные ключи (raw/squash), затем подстрочное вхождение по ключам индекса.
+    1) прямые ключи индекса (raw/squash)
+    2) подстрока в ключах индекса
+    3) фолбэк: скан всей таблицы по basename
     """
     if not code or _image_index is None:
         return ""
     raw, sq = _norm_code(code)
-    # точный хит
+
+    # 1) прямой хит
     hit = _image_index.get(raw) or _image_index.get(sq)
     if hit:
         return hit
-    # подстрочный хит
-    for k, url in _image_index.items():
-        if sq and sq in k:
-            return url
-        if raw and raw in k:
-            return url
-    return ""
-# =============================================================
 
+    # 2) подстроки в ключах индекса
+    for k, url in _image_index.items():
+        if (sq and sq in k) or (raw and raw in k):
+            return url
+
+    # 3) глобальный скан
+    return _scan_images_by_code_fallback(code)
+
+# ================== СКАЧИВАНИЕ ФОТО =========================
 async def _download_image_async(url: str) -> Optional[io.BytesIO]:
     try:
         async with aiohttp.ClientSession() as session:
@@ -449,7 +481,6 @@ async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
                 except Exception as e2:
                     logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-# =============================================================
 
 # --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
 def _truthy(x) -> bool:
@@ -617,7 +648,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # 1) Если есть анимация/видео — отправим (caption простой текст)
     if WELCOME_ANIMATION_URL:
         try:
             await context.bot.send_animation(
@@ -629,7 +659,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
 
-    # 2) Если задан твой file_id — отправим фото по нему
     sent_media = False
     if WELCOME_MEDIA_ID:
         try:
@@ -639,7 +668,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by file_id failed: {e}")
 
-    # 3) Если не получилось/не задано — попробуем WELCOME_PHOTO_URL (URL или другой file_id)
     if not sent_media and WELCOME_PHOTO_URL:
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
@@ -648,7 +676,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by URL/file_id failed: {e}")
 
-    # 4) Отдельным сообщением — «карточка» с HTML (безопасная отправка)
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
         f"<i>Инженерный бот для поиска и списания деталей</i>\n"
@@ -679,6 +706,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• <code>/cancel</code> — отменить списание\n"
             "• <code>/reload</code> — перезагрузка данных и пользователей (только админ)\n"
             "• <code>/fileid</code> — получить <i>file_id</i> из присланного медиа\n"
+            "• <code>/imgdebug &lt;код&gt;</code> — диагностика поиска фото\n"
         )
         await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
@@ -755,7 +783,7 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.video.file_id
         kind = "video"
     elif update.message.photo:
-        file_id = update.message.photo[-1].file_id  # самое крупное
+        file_id = update.message.photo[-1].file_id
         kind = "photo"
 
     if file_id:
@@ -768,6 +796,34 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
+
+# ===== /imgdebug — диагностика поиска фото =====
+async def imgdebug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        return await update.message.reply_text("Использование: /imgdebug <код>")
+    code = args[1].strip()
+    raw, sq = _norm_code(code)
+
+    idx_hit = _image_index.get(raw) or _image_index.get(sq) if _image_index else None
+    sub_hit = None
+    if _image_index and not idx_hit:
+        for k, url in _image_index.items():
+            if (sq and sq in k) or (raw and raw in k):
+                sub_hit = url
+                break
+    scan_hit = _scan_images_by_code_fallback(code) if not (idx_hit or sub_hit) else ""
+
+    msg = (
+        f"🔎 <b>IMGDEBUG</b>\n"
+        f"code: <code>{escape(code)}</code>\n"
+        f"raw:  <code>{escape(raw)}</code>\n"
+        f"sq:   <code>{escape(sq)}</code>\n"
+        f"— index direct: {idx_hit or '—'}\n"
+        f"— index substring: {sub_hit or '—'}\n"
+        f"— df scan fallback: {scan_hit or '—'}"
+    )
+    await _safe_send_html_message(context.bot, update.effective_chat.id, msg)
 
 # Меню приветствия — callbacks
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1118,12 +1174,11 @@ def build_app():
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
-
-    # /fileid
     app.add_handler(CommandHandler("fileid", fileid_cmd))
+    app.add_handler(CommandHandler("imgdebug", imgdebug_cmd))  # ⬅️ диагностика
+
     app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
 
-    # Меню приветствия
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
     app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
     app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
@@ -1181,3 +1236,4 @@ if __name__ == "__main__":
         drop_pending_updates=True,
         allowed_updates=None,
     )
+
