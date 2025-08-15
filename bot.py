@@ -576,7 +576,7 @@ def is_allowed(uid: int) -> bool:
     if uid in SHEET_BLOCKED:
         return False
     if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEЕТ_ADМИNS) or (uid in ADMINS)
+        return (uid in SHEET_ALLOWED) or (uid in SHEЕТ_ADМINS) or (uid in ADMINS)
     return True
 
 # --------------------- ГВАРДЫ -----------------------
