@@ -43,7 +43,7 @@ PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
 SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
 MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
-TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+TZ_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")  # по логу у тебя Asia/Tashkent
 PAGE_SIZE = 5
 
 # Приветствие / медиа
@@ -504,6 +504,7 @@ def _to_int_or_none(x):
 def load_users_from_sheet():
     client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
+    # ищем лист с пользователями
     try:
         ws = sh.worksheet("Пользователи")
     except gspread.WorksheetNotFound:
@@ -513,38 +514,97 @@ def load_users_from_sheet():
             logger.info("Лист 'Пользователи' не найден — доступ разрешён всем.")
             return set(), set(), set()
 
-    rows = ws.get_all_records()
+    # ----- читаем заголовки и делаем их уникальными -----
+    headers_raw = ws.row_values(1) or []
+    if not headers_raw:
+        logger.info("В листе 'Пользователи' пустая шапка — доступ разрешён всем.")
+        return set(), set(), set()
+
+    norm_headers: List[str] = []
+    seen: Set[str] = set()
+    for i, h in enumerate(headers_raw, start=1):
+        name = (h or "").strip()
+        if not name:
+            name = f"col_{i}"            # генерим имя для пустой ячейки
+        lname = name.lower()
+        lname = re.sub(r"\s+", " ", lname).strip()
+        base = lname
+        k = 1
+        while lname in seen:
+            k += 1
+            lname = f"{base}_{k}"
+        seen.add(lname)
+        norm_headers.append(lname)
+
+    # ----- читаем все строки, используя наши нормализованные заголовки -----
+    try:
+        rows = ws.get_all_records(expected_headers=norm_headers)
+    except Exception as e:
+        logger.warning(f"get_all_records с expected_headers не сработал ({e}), падаем на ручной парсинг.")
+        values = ws.get_all_values()
+        data_rows = values[1:] if len(values) > 1 else []
+        rows = []
+        for r in data_rows:
+            padded = (r + [""] * (len(norm_headers) - len(r)))[:len(norm_headers)]
+            rows.append({norm_headers[i]: padded[i] for i in range(len(norm_headers))})
+
     if not rows:
         logger.info("Лист 'Пользователи' пуст — доступ разрешён всем.")
         return set(), set(), set()
 
+    # ----- разбор строк в allowed/admins/blocked -----
     allowed, admins, blocked = set(), set(), set()
     for row in rows:
         r = {str(k).strip().lower(): v for k, v in row.items()}
+
+        def _to_int_or_none_local(x):
+            try:
+                if x is None or (isinstance(x, float) and pd.isna(x)):
+                    return None
+                s = str(x).strip()
+                if not s:
+                    return None
+                m = re.search(r"-?\d+", s)
+                return int(m.group(0)) if m else None
+            except Exception:
+                return None
+
         uid = (
-            _to_int_or_none(r.get("user_id"))
-            or _to_int_or_none(r.get("userid"))
-            or _to_int_or_none(r.get("id"))
-            or _to_int_or_none(r.get("uid"))
-            or _to_int_or_none(r.get("телеграм id"))
-            or _to_int_or_none(r.get("пользователь"))
+            _to_int_or_none_local(r.get("user_id"))
+            or _to_int_or_none_local(r.get("userid"))
+            or _to_int_or_none_local(r.get("id"))
+            or _to_int_or_none_local(r.get("uid"))
+            or _to_int_or_none_local(r.get("телеграм id"))
+            or _to_int_or_none_local(r.get("пользователь"))
+            or _to_int_or_none_local(r.get("user"))
         )
         if not uid:
             continue
 
         role = str(r.get("role") or r.get("роль") or "").strip().lower()
-        is_admin = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
-        is_allowed = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
-        is_blocked = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
+
+        def _truthy_local(x) -> bool:
+            s = str(x).strip().lower()
+            return (
+                s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок",
+                      "allowed", "разрешен", "разрешено", "доступ",
+                      "admin", "админ", "ban", "blocked", "запрет"}
+                or (s.isdigit() and int(s) > 0)
+            )
+
+        is_admin = role in {"admin", "админ", "administrator", "администратор"} or _truthy_local(r.get("admin"))
+        is_blocked = _truthy_local(r.get("blocked") or r.get("ban") or r.get("запрет"))
+        is_allowed = _truthy_local(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
 
         if is_blocked:
             blocked.add(uid)
         if is_admin:
             admins.add(uid)
             is_allowed = True
-        if is_allowed:
+        if is_allowed and not is_blocked:
             allowed.add(uid)
 
+    logger.info(f"Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
     return allowed, admins, blocked
 
 async def ensure_users_async(force: bool = False):
@@ -576,7 +636,7 @@ def is_allowed(uid: int) -> bool:
     if uid in SHEET_BLOCKED:
         return False
     if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEЕТ_ADМINS) or (uid in ADMINS)
+        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
     return True
 
 # --------------------- ГВАРДЫ -----------------------
@@ -794,7 +854,7 @@ async def capture_fileid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.bot,
             update.effective_chat.id,
             f"✅ {kind} file_id:\n<code>{escape(file_id)}</code>\n\n"
-            f"Скопируйте в ENV: WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHOTO_URL."
+            f"Скопируйте в ENV: WELCOME_MEDIA_ID / WELCOME_ANIMATION_URL / WELCOME_PHОТО_URL."
         )
     else:
         await update.message.reply_text("Это не поддерживаемое медиа. Отправьте фото/видео/гиф.")
