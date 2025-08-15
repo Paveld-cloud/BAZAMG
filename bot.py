@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
 from html import escape  # безопасный HTML
+from urllib.parse import urlparse, parse_qs  # ⬅️ для разбора имени файла из URL
 
 import aiohttp
 import gspread
@@ -161,20 +162,91 @@ def _norm_code(c: str) -> tuple[str, str]:
     squash = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
     return raw, squash
 
-# ================== КОД-ФИКС: индекс картинок ====================
+# ================== ПОМОЩНИКИ: имя файла из URL ==================
+def _filename_from_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    p = urlparse(u)
+    name = p.path.rsplit("/", 1)[-1]
+    if not name or "." not in name:
+        qnames = []
+        for v in parse_qs(p.query).values():
+            qnames.extend(v)
+        for cand in qnames + [p.fragment]:
+            if isinstance(cand, str) and "." in cand:
+                name = cand.rsplit("/", 1)[-1]
+                break
+    return name
+
+def _tokens_from_filename(u: str) -> list[str]:
+    """
+    Достаём токены из имени файла без расширения:
+    'E218PXI-8808 DRG500.jpg' -> ['e218pxi8808drg500', 'e218pxi', '8808', 'drg500']
+    """
+    name = _filename_from_url(u)
+    if not name:
+        return []
+    base = name.rsplit(".", 1)[0]
+    fused = re.sub(r"[\W_]+", "", base.lower(), flags=re.UNICODE)
+    parts = re.split(r"[\W_]+", base.lower())
+    parts = [p for p in parts if p]
+    seen, out = set(), []
+    for t in [fused] + parts:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+# ================== КОД-ФИКС: индекс картинок (по имени файла) ==
 def build_image_index(df: DataFrame) -> Dict[str, str]:
+    """
+    Индексируем картинки по кодам, встречающимся в НАЗВАНИИ ФОТО (basename URL).
+    Ключи в индексе — нормализованные токены из имени файла (и их слеплённые варианты),
+    плюс сами значения 'код'/'oem', если они содержатся в имени файла.
+    """
     if "image" not in df.columns:
         return {}
     index: Dict[str, str] = {}
+
     for _, row in df.iterrows():
-        code_val = str(row.get("код", "")).strip()
         url = str(row.get("image", "")).strip()
-        if not code_val or not url:
+        if not url:
             continue
-        raw, sq = _norm_code(code_val)
-        index[raw] = url
-        if sq and sq not in index:
-            index[sq] = url  # не перетираем raw
+
+        tokens = _tokens_from_filename(url)  # токены из basename
+        # привязываем все токены
+        for t in tokens:
+            rt, st = _norm_code(t)
+            if rt:
+                index.setdefault(rt, url)
+            if st and st != rt:
+                index.setdefault(st, url)
+
+        # если код присутствует в слеплённом имени — индексируем и им
+        code_val = str(row.get("код", "")).strip().lower()
+        if code_val:
+            raw, sq = _norm_code(code_val)
+            name_fused = tokens[:1]  # первый токен = слеплённый basename
+            if name_fused:
+                fused = name_fused[0]
+                if raw and raw in fused:
+                    index.setdefault(raw, url)
+                if sq and sq in fused:
+                    index.setdefault(sq, url)
+
+        # аналогично для OEM (если есть)
+        oem_val = str(row.get("oem", "")).strip().lower()
+        if oem_val:
+            raw, sq = _norm_code(oem_val)
+            name_fused = tokens[:1]
+            if name_fused:
+                fused = name_fused[0]
+                if raw and raw in fused:
+                    index.setdefault(raw, url)
+                if sq and sq in fused:
+                    index.setdefault(sq, url)
+
     return index
 # =================================================================
 
@@ -288,12 +360,26 @@ async def resolve_image_url_async(u: str) -> str:
         return await resolve_ibb_direct_async(u)
     return u
 
-# ================== КОД-ФИКС: поиск картинки по коду =========
+# ================== ПОИСК КАРТИНКИ ПО КОДУ ==================
 async def find_image_by_code_async(code: str) -> str:
+    """
+    Ищем фото по КОДУ в НАЗВАНИИ ФОТО.
+    Сначала точные ключи (raw/squash), затем подстрочное вхождение по ключам индекса.
+    """
     if not code or _image_index is None:
         return ""
     raw, sq = _norm_code(code)
-    return _image_index.get(raw) or _image_index.get(sq, "")
+    # точный хит
+    hit = _image_index.get(raw) or _image_index.get(sq)
+    if hit:
+        return hit
+    # подстрочный хит
+    for k, url in _image_index.items():
+        if sq and sq in k:
+            return url
+        if raw and raw in k:
+            return url
+    return ""
 # =============================================================
 
 async def _download_image_async(url: str) -> Optional[io.BytesIO]:
@@ -312,7 +398,7 @@ async def _download_image_async(url: str) -> Optional[io.BytesIO]:
         logger.warning(f"Download failed: {e}")
         return None
 
-# ================== КОД-ФИКС: отправка карточки ===============
+# ================== отправка карточки ========================
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
