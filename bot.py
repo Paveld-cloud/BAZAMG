@@ -10,7 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
-from html import escape
+from html import escape  # безопасный HTML
 
 import aiohttp
 import gspread
@@ -46,12 +46,12 @@ TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 PAGE_SIZE = 5
 
 # Приветствие / медиа
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # gif/mp4/file_id анимации/видео
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id фото
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # .gif/.mp4 или file_id
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL или file_id
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
 
-# Твой file_id для фото приветствия (используется в первую очередь)
-WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPsmieoFkGJUe8QwS-mA6sAj8jsT5WAALG7zEbiWb4SE7y8d4x4lXNAQADAgADeAADNgQ"
+# Твой file_id для фото приветствия (исп-ся в первую очередь)
+WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
@@ -155,17 +155,28 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
                     index[t].add(idx)
     return dict(index)
 
+# ================== КОД-ФИКС: нормализация кода ==================
+def _norm_code(c: str) -> tuple[str, str]:
+    raw = (c or "").strip().lower()
+    squash = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
+    return raw, squash
+
+# ================== КОД-ФИКС: индекс картинок ====================
 def build_image_index(df: DataFrame) -> Dict[str, str]:
     if "image" not in df.columns:
         return {}
-    index = {}
+    index: Dict[str, str] = {}
     for _, row in df.iterrows():
-        code = str(row.get("код", "")).strip().lower()
-        if code:
-            url = str(row.get("image", "")).strip()
-            if url:
-                index[code] = url
+        code_val = str(row.get("код", "")).strip()
+        url = str(row.get("image", "")).strip()
+        if not code_val or not url:
+            continue
+        raw, sq = _norm_code(code_val)
+        index[raw] = url
+        if sq and sq not in index:
+            index[sq] = url  # не перетираем raw
     return index
+# =================================================================
 
 def initial_load():
     global df, _last_load_ts, _search_index, _image_index
@@ -277,10 +288,13 @@ async def resolve_image_url_async(u: str) -> str:
         return await resolve_ibb_direct_async(u)
     return u
 
+# ================== КОД-ФИКС: поиск картинки по коду =========
 async def find_image_by_code_async(code: str) -> str:
     if not code or _image_index is None:
         return ""
-    return _image_index.get(code.strip().lower(), "")
+    raw, sq = _norm_code(code)
+    return _image_index.get(raw) or _image_index.get(sq, "")
+# =============================================================
 
 async def _download_image_async(url: str) -> Optional[io.BytesIO]:
     try:
@@ -298,10 +312,15 @@ async def _download_image_async(url: str) -> Optional[io.BytesIO]:
         logger.warning(f"Download failed: {e}")
         return None
 
+# ================== КОД-ФИКС: отправка карточки ===============
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
+
     url_raw = await find_image_by_code_async(code)
+    if not url_raw:
+        url_raw = str(row.get("image", "")).strip()  # фолбэк к значению из строки
+
     url = await resolve_image_url_async(url_raw)
 
     if url:
@@ -323,8 +342,13 @@ async def send_row_with_image(update: Update, row: dict, text: str):
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
+
     url_raw = await find_image_by_code_async(code)
+    if not url_raw:
+        url_raw = str(row.get("image", "")).strip()
+
     url = await resolve_image_url_async(url_raw)
+
     if url:
         try:
             await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
@@ -339,6 +363,7 @@ async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
                 except Exception as e2:
                     logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+# =============================================================
 
 # --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
 def _truthy(x) -> bool:
@@ -506,7 +531,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # 1) Анимация/видео (если указано)
+    # 1) Если есть анимация/видео — отправим (caption простой текст)
     if WELCOME_ANIMATION_URL:
         try:
             await context.bot.send_animation(
@@ -518,7 +543,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
 
-    # 2) Фото по file_id (приоритет)
+    # 2) Если задан твой file_id — отправим фото по нему
     sent_media = False
     if WELCOME_MEDIA_ID:
         try:
@@ -528,7 +553,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by file_id failed: {e}")
 
-    # 3) Фото по URL/другому file_id
+    # 3) Если не получилось/не задано — попробуем WELCOME_PHOTO_URL (URL или другой file_id)
     if not sent_media and WELCOME_PHOTO_URL:
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
@@ -537,10 +562,10 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by URL/file_id failed: {e}")
 
-    # 4) Карточка с подсказками (без «инженерный»)
+    # 4) Отдельным сообщением — «карточка» с HTML (безопасная отправка)
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<i>Бот для поиска и списания деталей</i>\n"
+        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
         f"────────\n"
         f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
         f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
@@ -623,7 +648,7 @@ def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf.name = name
     return buf
 
-# ===== /fileid: получить file_id из медиа =====
+# ===== /fileid режим: быстро получить file_id из медиа =====
 async def fileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["await_fileid"] = True
     await update.message.reply_text(
@@ -663,7 +688,7 @@ async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
-    await _safe_send_html_message(context.bot, q.message.chat.id, msg)
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -675,7 +700,7 @@ async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "3) Укажите количество и комментарий.\n"
         "4) Подтвердите списание кнопкой «Да»."
     )
-    await _safe_send_html_message(context.bot, q.message.chat.id, msg)
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -998,11 +1023,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Guards
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("more", more_cmd))
@@ -1014,16 +1037,14 @@ def build_app():
     app.add_handler(CommandHandler("fileid", fileid_cmd))
     app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
 
-    # Welcome menu
+    # Меню приветствия
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
     app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
     app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
 
-    # Pagination & cancel
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
-    # Conversation for issuing
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
@@ -1048,10 +1069,7 @@ def build_app():
     )
     app.add_handler(conv)
 
-    # Search
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
-
-    # Errors
     app.add_error_handler(on_error)
 
     return app
