@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
 from html import escape  # безопасный HTML
-from urllib.parse import urlparse, parse_qs, unquote  # ⬅️ добавлен unquote
+from urllib.parse import urlparse, parse_qs, unquote  # для извлечения имени файла из URL
 
 import aiohttp
 import gspread
@@ -205,6 +205,7 @@ def _fuse(text: str) -> str:
 def _scan_images_by_code_fallback(code: str) -> str:
     """
     Последняя линия обороны: сканируем весь df['image'] и сверяем «слеплённый» код с «слеплённым» basename.
+    (Это всё ещё поиск по КОДУ, а не «картинка из строки».)
     """
     global df
     if df is None or "image" not in df.columns:
@@ -435,51 +436,52 @@ async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
 
+    # Ищем фото ТОЛЬКО по коду
     url_raw = await find_image_by_code_async(code)
-    if not url_raw:
-        url_raw = str(row.get("image", "")).strip()  # фолбэк к значению из строки
 
-    url = await resolve_image_url_async(url_raw)
+    if url_raw:
+        url = await resolve_image_url_async(url_raw)
+        if url:
+            try:
+                await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
+                return
+            except Exception as e:
+                logger.warning(f"URL фото не сработал ({url}): {e}")
+                bio = await _download_image_async(url)
+                if bio:
+                    try:
+                        await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
+                        return
+                    except Exception as e2:
+                        logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
 
-    if url:
-        try:
-            await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
-            return
-        except Exception as e:
-            logger.warning(f"URL фото не сработал ({url}): {e}")
-            bio = await _download_image_async(url)
-            if bio:
-                try:
-                    await update.message.reply_photo(photo=bio, caption=text, reply_markup=kb)
-                    return
-                except Exception as e2:
-                    logger.warning(f"Скачивание/отправка фото не удалось: {e2} (src: {url})")
-
+    # Если фото по коду не нашли — отправляем только текст
     await update.message.reply_text(text, reply_markup=kb)
 
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code.lower()}")]])
 
+    # Ищем фото ТОЛЬКО по коду
     url_raw = await find_image_by_code_async(code)
-    if not url_raw:
-        url_raw = str(row.get("image", "")).strip()
 
-    url = await resolve_image_url_async(url_raw)
+    if url_raw:
+        url = await resolve_image_url_async(url_raw)
+        if url:
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
+                return
+            except Exception as e:
+                logger.warning(f"URL фото не сработал ({url}): {e}")
+                bio = await _download_image_async(url)
+                if bio:
+                    try:
+                        await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
+                        return
+                    except Exception as e2:
+                        logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
 
-    if url:
-        try:
-            await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
-            return
-        except Exception as e:
-            logger.warning(f"URL фото не сработал ({url}): {e}")
-            bio = await _download_image_async(url)
-            if bio:
-                try:
-                    await bot.send_photo(chat_id=chat_id, photo=bio, caption=text, reply_markup=kb)
-                    return
-                except Exception as e2:
-                    logger.warning(f"Отправка скачанного фото не удалась: {e2} (src: {url})")
+    # Если фото по коду не нашли — отправляем только текст
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 # --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
@@ -574,7 +576,7 @@ def is_allowed(uid: int) -> bool:
     if uid in SHEET_BLOCKED:
         return False
     if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
+        return (uid in SHEET_ALLOWED) or (uid in SHEЕТ_ADМИNS) or (uid in ADMINS)
     return True
 
 # --------------------- ГВАРДЫ -----------------------
@@ -1175,7 +1177,7 @@ def build_app():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("fileid", fileid_cmd))
-    app.add_handler(CommandHandler("imgdebug", imgdebug_cmd))  # ⬅️ диагностика
+    app.add_handler(CommandHandler("imgdebug", imgdebug_cmd))
 
     app.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.PHOTO, capture_fileid))
 
@@ -1236,4 +1238,3 @@ if __name__ == "__main__":
         drop_pending_updates=True,
         allowed_updates=None,
     )
-
