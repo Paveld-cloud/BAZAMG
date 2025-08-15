@@ -51,7 +51,7 @@ WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # URL и
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
 
 # Твой file_id для фото приветствия (используется в первую очередь)
-WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
+WELCOME_MEDIA_ID = "AgACAgIAAxkBAAIPsmieoFkGJUe8QwS-mA6sAj8jsT5WAALG7zEbiWb4SE7y8d4x4lXNAQADAgADeAADNgQ"
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_URL, CREDS_JSON, WEBHOOK_URL]):
     raise RuntimeError("ENV нужны: TELEGRAM_TOKEN, SPREADSHEET_URL, GOOGLE_APPLICATION_CREDENTIALS_JSON, WEBHOOK_URL")
