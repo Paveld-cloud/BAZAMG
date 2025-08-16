@@ -1,626 +1,463 @@
-# app/handlers.py
+# app/data.py
 import io
+import re
+import time
 import math
+import json
 import asyncio
 import logging
 from html import escape
+from typing import Optional, Dict, Any, Set, List, DefaultDict
+from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
+import aiohttp
+import gspread
+import pandas as pd
+from pandas import DataFrame
+from google.oauth2.service_account import Credentials
 
-from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, ContextTypes, filters, ApplicationHandlerStop
-)
-
-# конфиг
+# ==== конфиг ====
 from app.config import (
-    PAGE_SIZE, MAX_QTY,
-    WELCOME_ANIMATION_URL, WELCOME_PHOTO_URL, SUPPORT_CONTACT, WELCOME_MEDIA_ID,
-    SPREADSHEET_URL, ADMINS
+    SPREADSHEET_URL, CREDS_JSON, SHEET_NAME,
+    SCOPES, DATA_TTL, USERS_TTL, TZ_NAME
 )
 
-# ВАЖНО: модуль целиком — для «живого» доступа к df
-import app.data as data
+# SEARCH_FIELDS можно переопределить в config, иначе используем дефолт
+try:
+    from app.config import SEARCH_FIELDS  # type: ignore
+except Exception:
+    SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
 
-# функции/структуры из data (без df)
-from app.data import (
-    user_state, issue_state,
-    ensure_fresh_data, ensure_fresh_data_async,
-    format_row, normalize, squash, match_row_by_index, _safe_col, _relevance_score,
-    find_image_by_code_async, resolve_image_url_async,
-    val, now_local_str, get_gs_client, _df_to_xlsx,
-    load_users_from_sheet, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED,
-    ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM,
-)
+logger = logging.getLogger("bot.data")
 
-logger = logging.getLogger("bot.handlers")
+# ---------------------- ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ----------------
+df: Optional[DataFrame] = None
+_last_load_ts = 0.0
+_search_index: Optional[Dict[str, Set[int]]] = None
 
-# ---------- Кнопки ----------
-def cancel_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]])
+# Кэш картинок: ключ — нормализованный код, значение — URL
+_image_index: Optional[Dict[str, str]] = None
 
-def confirm_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Да, списать", callback_data="confirm_yes"),
-         InlineKeyboardButton("❌ Нет", callback_data="confirm_no")],
-        [InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]
-    ])
+# Пользовательские допуски (из листа "Пользователи"/"Users")
+SHEET_ALLOWED: Set[int] = set()
+SHEET_ADMINS: Set[int] = set()
+SHEET_BLOCKED: Set[int] = set()
+_last_users_ts = 0.0
 
-def more_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
+# Память диалогов
+user_state: Dict[int, Dict[str, Any]] = {}
+issue_state: Dict[int, Dict[str, Any]] = {}
 
-def main_menu_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search")],
-        [InlineKeyboardButton("📦 Как списать деталь", callback_data="menu_issue_help")],
-        [InlineKeyboardButton("📞 Поддержка", callback_data="menu_contact")],
-    ])
+# Флаги конкуренции
+_loading_data = False
+_loading_users = False
 
-# ---------- Безопасная отправка HTML ----------
-async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
+# Стейты диалога списания (для ConversationHandler)
+ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
+
+# -------------------------- ВСПОМОГАТЕЛЬНОЕ -----------------
+def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     try:
-        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
-    except Exception as e:
-        logger.warning(f"HTML parse failed, fallback to plain: {e}")
-        import re
-        no_tags = re.sub(r"</?(b|i|code)>", "", text)
-        kwargs.pop("parse_mode", None)
-        return await bot.send_message(chat_id=chat_id, text=no_tags, **kwargs)
-
-# --------------------- Пользователи (допуски) -----------------
-async def ensure_users_async(force: bool = False):
-    allowed, admins, blocked = await asyncio.to_thread(load_users_from_sheet)
-    SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
-    SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
-    SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
-
-def ensure_users(force: bool = False):
-    asyncio.create_task(ensure_users_async(force=True))
-
-def is_admin_local(uid: int) -> bool:
-    ensure_users()
-    return uid in SHEET_ADMINS or uid in ADMINS
-
-def is_allowed_local(uid: int) -> bool:
-    ensure_users()
-    if uid in SHEET_BLOCKED:
-        return False
-    if SHEET_ALLOWED:
-        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS) or (uid in ADMINS)
-    return True
-
-# --------------------- Гварды -----------------
-async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user and not is_allowed_local(user.id):
-        try:
-            await update.effective_message.reply_text("Доступ запрещён.")
-        except Exception:
-            pass
-        raise ApplicationHandlerStop
-
-async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user and not is_allowed_local(user.id):
-        try:
-            await update.callback_query.answer("Доступ запрещён.", show_alert=True)
-        except Exception:
-            pass
-        raise ApplicationHandlerStop
-
-# --------------------- Приветствие -----------------
-async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    first = escape((user.first_name or "").strip() or "коллега")
-
-    # 1) анимация (gif/mp4). Фото сюда не подойдёт.
-    if WELCOME_ANIMATION_URL:
-        try:
-            await context.bot.send_animation(
-                chat_id=chat_id,
-                animation=WELCOME_ANIMATION_URL,
-                caption=f"⚙️ Добро пожаловать, {first}!"
-            )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.warning(f"Welcome animation failed: {e}")
-
-    # 2) фото по file_id
-    sent_media = False
-    if WELCOME_MEDIA_ID:
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, disable_notification=True)
-            sent_media = True
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.warning(f"Welcome photo by file_id failed: {e}")
-
-    # 3) фото по URL
-    if not sent_media and WELCOME_PHOTO_URL:
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
-            sent_media = True
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.warning(f"Welcome photo by URL/file_id failed: {e}")
-
-    # 4) карточка
-    card_html = (
-        f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
-        f"────────\n"
-        f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
-        f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
-        f"• Подтвердите списание — и готово\n\n"
-        f"Пример: <code>PI 8808 DRG 500</code>\n"
-        f"Удачной работы! 🚀"
-    )
-    await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
-
-# callbacks из приветственного меню
-async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
-    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
-
-async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    msg = (
-        "<b>Как списать деталь</b>:\n"
-        "1) Выполните поиск по названию/коду.\n"
-        "2) В карточке нажмите «📦 Взять деталь».\n"
-        "3) Укажите количество и комментарий.\n"
-        "4) Подтвердите списание кнопкой «Да»."
-    )
-    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
-
-async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(f"{SUPPORT_CONTACT}")
-
-# --------------------- Фото карточки -----------------
-async def send_row_with_image(update: Update, row: dict, text: str):
-    # показываем фото ТОЛЬКО если нашли по коду (не берём из столбца строки)
-    code = str(row.get("код", "")).strip().lower()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
-
-    url_raw = await find_image_by_code_async(code)
-    if url_raw:
-        url = await resolve_image_url_async(url_raw)
-        if url:
-            try:
-                await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"URL фото не сработал ({url}): {e}")
-    await update.message.reply_text(text, reply_markup=kb)
-
-async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
-    code = str(row.get("код", "")).strip().lower()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
-
-    url_raw = await find_image_by_code_async(code)
-    if url_raw:
-        url = await resolve_image_url_async(url_raw)
-        if url:
-            try:
-                await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"URL фото не сработал ({url}): {e}")
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-
-# --------------------- Команды -----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    issue_state.pop(uid, None)
-    user_state.pop(uid, None)
-    await send_welcome_sequence(update, context)
-    if update.message:
-        await asyncio.sleep(0.2)
-        cmds_html = (
-            "<b>Команды</b>:\n"
-            "• <code>/help</code> — помощь\n"
-            "• <code>/more</code> — показать ещё\n"
-            "• <code>/export</code> — выгрузка результатов (XLSX/CSV)\n"
-            "• <code>/cancel</code> — отменить списание\n"
-            "• <code>/reload</code> — перезагрузка данных и пользователей (только админ)\n"
-        )
-        await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "<b>Как пользоваться</b>:\n"
-        "1) Выполните поиск по названию/модели/коду.\n"
-        "2) В карточке нажмите «📦 Взять деталь» — бот спросит количество и комментарий.\n"
-        "3) Подтвердите списание (Да/Нет).\n"
-        "<i>У вас всё получится!</i>"
-    )
-    await _safe_send_html_message(context.bot, update.effective_chat.id, msg)
-
-async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin_local(uid):
-        return await update.message.reply_text("Доступ запрещён.")
-    ensure_fresh_data(force=True)
-    ensure_users(force=True)
-    await update.message.reply_text("✅ Данные и пользователи перезагружены (в фоне).")
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if issue_state.pop(uid, None):
-        await update.message.reply_text("❌ Операция списания отменена.")
-    else:
-        await update.message.reply_text("Нет активной операции.")
-
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    if results is None or results.empty:
-        return await update.message.reply_text("Сначала выполните поиск.")
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    try:
-        buf = await asyncio.to_thread(_df_to_xlsx, results, f"export_{timestamp}.xlsx")
-        await update.message.reply_document(InputFile(buf, filename=f"export_{timestamp}.xlsx"))
-    except Exception as e:
-        logger.warning(f"Не удалось XLSX (fallback CSV): {e}")
-        csv = results.to_csv(index=False, encoding="utf-8-sig")
-        await update.message.reply_document(
-            InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{timestamp}.csv")
-        )
-
-async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    if results is None or results.empty:
-        return await update.message.reply_text("Сначала выполните поиск.")
-    st["page"] = st.get("page", 0) + 1
-    await send_page(update, uid)
-
-# --------------------- Разбивка результатов на страницы -----------------
-async def send_page(update: Update, uid: int):
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    page = st.get("page", 0)
-
-    total = len(results)
-    if total == 0:
-        return await update.message.reply_text("Результатов больше нет.")
-    pages = max(1, math.ceil(total / PAGE_SIZE))
-    if page >= pages:
-        st["page"] = pages - 1
-        return await update.message.reply_text("Больше результатов нет.")
-
-    start_i = page * PAGE_SIZE
-    end_i = min(start_i + PAGE_SIZE, total)
-
-    await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start_i + 1}–{end_i} из {total}.")
-    for _, row in results.iloc[start_i:end_i].iterrows():
-        await send_row_with_image(update, row.to_dict(), format_row(row.to_dict()))
-    if end_i < total:
-        await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
-
-async def send_page_via_bot(bot, chat_id: int, uid: int):
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    page = st.get("page", 0)
-    total = len(results)
-    if total == 0:
-        return await bot.send_message(chat_id=chat_id, text="Результатов больше нет.")
-    pages = max(1, math.ceil(total / PAGE_SIZE))
-    if page >= pages:
-        st["page"] = pages - 1
-        return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
-    start_i = page * PAGE_SIZE
-    end_i = min(start_i + PAGE_SIZE, total)
-    await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start_i + 1}–{end_i} из {total}.")
-    chunk = results.iloc[start_i:end_i]
-    for _, row in chunk.iterrows():
-        await send_row_with_image_bot(bot, chat_id, row.to_dict(), format_row(row.to_dict()))
-    if end_i < total:
-        await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
-
-# --------------------- Поиск -----------------
-async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-
-    # подавим ложный поиск во время диалога списания
-    if context.chat_data.pop("suppress_next_search", False):
-        return
-
-    uid = update.effective_user.id
-    st_issue = issue_state.get(uid)
-    if st_issue:
-        if "quantity" not in st_issue:
-            return await update.message.reply_text(
-                "Вы вводите количество. Введите число или нажмите «Отменить».",
-                reply_markup=cancel_markup()
-            )
-        if st_issue.get("await_comment"):
-            return await update.message.reply_text(
-                "Вы вводите комментарий. Напишите текст или «-», либо нажмите «Отменить».",
-                reply_markup=cancel_markup()
-            )
-
-    q = (update.message.text or "").strip()
-    if not q:
-        return await update.message.reply_text("Введите запрос.")
-    tokens = normalize(q).split()
-    if not tokens:
-        return await update.message.reply_text("Введите более конкретный запрос.")
-    q_squash = squash(q)
-
-    # ЖИВОЙ доступ к df
-    if data.df is None:
-        await ensure_fresh_data_async(force=True)
-        if data.df is None:
-            return await update.message.reply_text("Ошибка загрузки данных.")
-    cur_df = data.df
-
-    matched_indices = match_row_by_index(tokens)
-
-    from pandas import Series
-    if not matched_indices:
-        mask_any = Series(False, index=cur_df.index)
-        for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
-            series = _safe_col(cur_df, col)
-            if series is None:
-                continue
-            field_mask = Series(True, index=cur_df.index)
-            for t in tokens:
-                if t:
-                    field_mask &= series.str.contains(t, na=False)
-            mask_any |= field_mask
-        matched_indices = set(cur_df.index[mask_any])
-
-    if not matched_indices and q_squash:
-        mask_any = Series(False, index=cur_df.index)
-        for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
-            series = _safe_col(cur_df, col)
-            if series is None:
-                continue
-            series_sq = series.str.replace(r'[\W_]+', '', regex=True)
-            mask_any |= series_sq.str.contains(q_squash, na=False)
-        matched_indices = set(cur_df.index[mask_any])
-
-    if not matched_indices:
-        return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
-
-    idx_list = list(matched_indices)
-    results_df = cur_df.loc[idx_list].copy()
-
-    scores = []
-    for _, r in results_df.iterrows():
-        scores.append(_relevance_score(r.to_dict(), tokens, q_squash))
-    results_df["__score"] = scores
-
-    if "код" in results_df.columns:
-        results_df = results_df.sort_values(
-            by=["__score", "код"],
-            ascending=[False, True],
-            key=lambda s: s if s.name != "код" else s.astype(str).str.len()
-        )
-    else:
-        results_df = results_df.sort_values(by=["__score"], ascending=False)
-    results_df = results_df.drop(columns="__score")
-
-    st = user_state.setdefault(uid, {})
-    st["query"] = q
-    st["results"] = results_df
-    st["page"] = 0
-
-    await send_page(update, uid)
-
-# ------------------ Списание (диалог) -----------------
-async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    code = q.data.split(":", 1)[1].strip().lower()
-
-    cur_df = data.df
-    found = None
-    if cur_df is not None and "код" in cur_df.columns:
-        hit = cur_df[cur_df["код"].astype(str).str.lower() == code]
-        if not hit.empty:
-            found = hit.iloc[0].to_dict()
-
-    if not found:
-        return await q.edit_message_text("Не удалось найти деталь по коду. Выполните поиск заново.")
-
-    issue_state[uid] = {"part": found}
-    await q.message.reply_text("Сколько списать? Укажите число (например: 1 или 2.5).", reply_markup=cancel_markup())
-    return ASK_QUANTITY
-
-async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["suppress_next_search"] = True
-    uid = update.effective_user.id
-    text = (update.message.text or "").strip().replace(",", ".")
-    try:
-        qty = float(text)
-        if not math.isfinite(qty) or qty <= 0 or qty > MAX_QTY:
-            raise ValueError
-        qty = float(f"{qty:.3f}")
+        return datetime.now(ZoneInfo(TZ_NAME)).strftime(fmt)
     except Exception:
-        return await update.message.reply_text(
-            f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
-            reply_markup=cancel_markup()
-        )
-    st = issue_state.get(uid)
-    if not st or "part" not in st:
-        return await update.message.reply_text("Списание неактивно — начните заново из карточки.")
-    st["quantity"] = qty
-    st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
-    return ASK_COMMENT
+        return datetime.utcnow().strftime(fmt)
 
-async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["suppress_next_search"] = True
-    uid = update.effective_user.id
-    comment = (update.message.text or "").strip()
-    st = issue_state.get(uid)
-    if not st:
-        return await update.message.reply_text("Списание неактивно. Начните заново из карточки.")
-    part = st.get("part")
-    qty = st.get("quantity")
-    if part is None or qty is None:
-        issue_state.pop(uid, None)
-        return await update.message.reply_text("Что-то пошло не так. Попробуйте ещё раз.")
-    st["comment"] = "" if comment == "-" else comment
-    st["await_comment"] = False
+def val(row: dict, key: str, default: str = "—") -> str:
+    v = row.get(key)
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return default
+    s = str(v).strip()
+    return s if s else default
 
-    text = (
-        "Вы уверены, что хотите списать деталь?\n\n"
-        f"🔢 Код: {val(part, 'код')}\n"
-        f"📦 Наименование: {val(part, 'наименование')}\n"
-        f"📦 Кол-во: {qty}\n"
-        f"💬 Комментарий: {st['comment'] or '—'}"
+def format_row(row: dict) -> str:
+    return (
+        f"🔹 Тип: {val(row, 'тип')}\n"
+        f"📦 Наименование: {val(row, 'наименование')}\n"
+        f"🔢 Код: {val(row, 'код')}\n"
+        f"📦 Кол-во: {val(row, 'количество')}\n"
+        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}\n"
+        f"🏭 Изготовитель: {val(row, 'изготовитель')}\n"
+        f"⚙️ OEM: {val(row, 'oem')}"
     )
-    await update.message.reply_text(text, reply_markup=confirm_markup())
-    return ASK_CONFIRM
 
-async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    import gspread
+def normalize(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
+
+def squash(text: str) -> str:
+    return re.sub(r"[\W_]+", "", (text or "").lower(), flags=re.UNICODE)
+
+# ------------------------- GOOGLE SHEETS ---------------------
+def get_gs_client():
+    creds_info = json.loads(CREDS_JSON)
+    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def _open_data_worksheet(client):
+    sh = client.open_by_url(SPREADSHEET_URL)
+    if SHEET_NAME:
+        try:
+            return sh.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            logger.warning(f"Лист {SHEET_NAME!r} не найден, fallback на sheet1")
+    return sh.sheet1
+
+def _get_all_records_safe(ws) -> list[dict]:
+    """
+    Безопасный парсер таблицы (устойчив к дублям/пустым заголовкам).
+    """
+    values: List[List[Any]] = ws.get_all_values()
+    if not values:
+        return []
+    # найдём первую непустую строку как заголовки
+    header_row_idx = 0
+    for i, row in enumerate(values):
+        if any(str(c).strip() for c in row):
+            header_row_idx = i
+            break
+    headers_raw = [str(h).strip() for h in values[header_row_idx]]
+    # если заголовок пуст — подставим плейсхолдер
+    headers = []
+    used = set()
+    for i, h in enumerate(headers_raw):
+        name = h or f"__col_{i}"
+        # дедуп
+        base = name
+        k = 1
+        while name.lower() in used:
+            k += 1
+            name = f"{base}_{k}"
+        used.add(name.lower())
+        headers.append(name)
+    data_rows = values[header_row_idx + 1:]
+    out: List[dict] = []
+    for r in data_rows:
+        # выравниваем длину
+        row = list(r) + [""] * (len(headers) - len(r))
+        d = {headers[i]: row[i] for i in range(len(headers))}
+        out.append(d)
+    return out
+
+def load_data_blocking() -> list[dict]:
     client = get_gs_client()
+    ws = _open_data_worksheet(client)
+    try:
+        # пробуем быстро
+        return ws.get_all_records()
+    except Exception as e:
+        logger.warning(f"get_all_records упал ({e}), переключаюсь на _get_all_records_safe()")
+        return _get_all_records_safe(ws)
+
+# --------------------- ПОИСК (индекс) ------------------------
+def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
+    index: DefaultDict[str, Set[int]] = defaultdict(set)
+    for col in SEARCH_FIELDS:
+        if col not in df.columns:
+            continue
+        for idx, val in df[col].astype(str).str.lower().items():
+            for t in re.findall(r'\w+', val):
+                if t:
+                    index[t].add(idx)
+    return dict(index)
+
+def match_row_by_index(tokens: List[str]) -> Set[int]:
+    if not _search_index:
+        return set()
+    result = None
+    for t in tokens:
+        indices = _search_index.get(t, set())
+        if result is None:
+            result = indices.copy()
+        else:
+            result &= indices
+        if not result:
+            break
+    return result or set()
+
+def _safe_col(df_: DataFrame, col: str) -> Optional[pd.Series]:
+    return df_[col].astype(str).str.lower() if col in df_.columns else None
+
+def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
+    score = 0
+    for f in SEARCH_FIELDS:
+        val_ = str(row.get(f, "")).lower()
+        if not val_:
+            continue
+        words = set(re.findall(r'\w+', val_))
+        tok_hit = sum(1 for t in tokens if t in words)
+        sub_hit = sum(1 for t in tokens if t and t in val_)
+        sq = re.sub(r'[\W_]+', '', val_)
+        squash_hit = 1 if q_squash and q_squash in sq else 0
+        weight = 2 if f in ("код", "oem") else 1
+        score += weight * (2 * tok_hit + sub_hit) + 3 * squash_hit * weight
+    return score
+
+# --------------------- Картинки по КОДУ -----------------------
+def _norm_code(c: str) -> tuple[str, str]:
+    raw = (c or "").strip().lower()
+    squash_ = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
+    return raw, squash_
+
+def _filename_from_url(u: str) -> str:
+    """
+    Достаём имя файла из URL, даже если это ibb/drive.
+    """
+    try:
+        pu = urlparse(u)
+        # drive open?id=... — имени нет, но часто есть в og:image, это уже разрулим на этапе resolve_ibb/drive
+        name = pu.path.rsplit("/", 1)[-1]
+        if not name or "." not in name:
+            # иногда имя в query (?name=xxx.jpg)
+            qs = parse_qs(pu.query)
+            for k in ("name", "filename", "file", "img"):
+                if k in qs and qs[k]:
+                    return qs[k][0]
+        return name
+    except Exception:
+        return ""
+
+def build_image_index(df_: DataFrame) -> Dict[str, str]:
+    """
+    Индекс картинок строго по КОДУ:
+    - ключи: raw и squash(код)
+    - значение: URL из столбца 'image' (если он не пустой)
+    *никакого фолбэка на картинку из строки при отправке — это только индекс*
+    """
+    if "image" not in df_.columns:
+        return {}
+    index: Dict[str, str] = {}
+    for _, row in df_.iterrows():
+        code_val = str(row.get("код", "")).strip()
+        url = str(row.get("image", "")).strip()
+        if not code_val or not url:
+            continue
+        raw, sq = _norm_code(code_val)
+        if raw and raw not in index:
+            index[raw] = url
+        if sq and sq not in index:
+            index[sq] = url
+    return index
+
+async def resolve_ibb_direct_async(url: str) -> str:
+    """
+    Для ibb.co: превращаем в прямой URL к картинке через og:image
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    return url
+                html = await resp.text()
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        return m.group(1) if m else url
+    except Exception as e:
+        logger.warning(f"resolve_ibb_direct_async fail: {e}")
+        return url
+
+def normalize_drive_url(url: str) -> str:
+    m = re.search(r'drive\.google\.com/(?:file/d/([-\w]{20,})|open\?id=([-\w]{20,}))', url)
+    if m:
+        file_id = m.group(1) or m.group(2)
+        return f'https://drive.google.com/uc?export=download&id={file_id}'
+    return url
+
+async def resolve_image_url_async(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return u
+    if "drive.google.com" in u:
+        return normalize_drive_url(u)
+    if re.match(r"^https?://(www\.)?ibb\.co/", u, re.I):
+        return await resolve_ibb_direct_async(u)
+    return u
+
+async def find_image_by_code_async(code: str) -> str:
+    """
+    1) Ищем в _image_index по raw/squash(код).
+    2) Если нет — пробегаем по всем image, ищем код как подстроку в имени файла (без знаков).
+    Возвращаем ПУСТО, если не нашли (handlers отправят карточку без фото).
+    """
+    if not code:
+        return ""
+    raw, sq = _norm_code(code)
+    if _image_index:
+        url = _image_index.get(raw) or _image_index.get(sq)
+        if url:
+            return url
+
+    # медленный путь: поиск в df по имени
+    global df
+    if df is None or "image" not in df.columns:
+        return ""
+    target = sq
+    for _, row in df.iterrows():
+        url = str(row.get("image", "")).strip()
+        if not url:
+            continue
+        name = _filename_from_url(url)
+        name_sq = squash(name)
+        if target and target in name_sq:
+            return url
+    return ""
+
+async def _download_image_async(url: str) -> Optional[io.BytesIO]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=12) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                if len(data) > 5_000_000:
+                    return None
+                bio = io.BytesIO(data)
+                bio.name = "image"
+                return bio
+    except Exception as e:
+        logger.warning(f"Download failed: {e}")
+        return None
+
+# ------------------------- ЗАГРУЗКА ДАННЫХ -------------------
+def initial_load():
+    """
+    Синхронная загрузка при старте.
+    """
+    global df, _last_load_ts, _search_index, _image_index
+    data = load_data_blocking()
+    new_df = DataFrame(data)
+    new_df.columns = new_df.columns.str.strip().str.lower()
+
+    for col in ("код", "oem"):
+        if col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+    if "image" in new_df.columns:
+        new_df["image"] = new_df["image"].astype(str).str.strip()
+
+    df = new_df
+    _search_index = build_search_index(df)
+    _image_index = build_image_index(df)
+    _last_load_ts = time.time()
+    logger.info(f"✅ Загружено (startup) {len(df)} строк и индексы")
+
+    # сразу подгрузим пользователей
+    allowed, admins, blocked = load_users_from_sheet()
+    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
+    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
+    _last_users_ts = time.time()
+    logger.info(f"👥 Пользователи (startup): allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+
+async def ensure_fresh_data_async(force: bool = False):
+    global df, _last_load_ts, _search_index, _image_index, _loading_data
+    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
+        return
+    if _loading_data:
+        return
+    _loading_data = True
+    try:
+        data = await asyncio.to_thread(load_data_blocking)
+        new_df = DataFrame(data)
+        new_df.columns = new_df.columns.str.strip().str.lower()
+        for col in ("код", "oem"):
+            if col in new_df.columns:
+                new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+        if "image" in new_df.columns:
+            new_df["image"] = new_df["image"].astype(str).str.strip()
+
+        df = new_df
+        _search_index = build_search_index(df)
+        _image_index = build_image_index(df)
+        _last_load_ts = time.time()
+        logger.info(f"✅ Перезагружено {len(df)} строк и индексы")
+    finally:
+        _loading_data = False
+
+def ensure_fresh_data(force: bool = False):
+    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
+        return
+    asyncio.create_task(ensure_fresh_data_async(force=True))
+
+# ---------------------- ВЫГРУЗКА (XLSX/CSV) ------------------
+def _df_to_xlsx(df_: DataFrame, name: str) -> io.BytesIO:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df_.to_excel(w, index=False)
+    buf.seek(0)
+    buf.name = name
+    return buf
+
+# --------------------- ПОЛЬЗОВАТЕЛИ -------------------------
+def _truthy(x) -> bool:
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок", "allowed", "разрешен", "разрешено"} or (s.isdigit() and int(s) > 0)
+
+def _to_int_or_none(x):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        return int(m.group(0)) if m else None
+    except Exception:
+        return None
+
+def _open_users_worksheet(client):
     sh = client.open_by_url(SPREADSHEET_URL)
     try:
-        ws = sh.worksheet("История")
+        return sh.worksheet("Пользователи")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="История", rows=1000, cols=12)
-        ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
+        try:
+            return sh.worksheet("Users")
+        except gspread.WorksheetNotFound:
+            return None
 
-    headers_raw = ws.row_values(1)
-    headers = [h.strip() for h in headers_raw]
-    norm = [h.lower() for h in headers]
+def load_users_from_sheet():
+    client = get_gs_client()
+    ws = _open_users_worksheet(client)
+    if ws is None:
+        logger.info("Лист 'Пользователи' не найден — доступ разрешён всем.")
+        return set(), set(), set()
 
-    full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
-    display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
-    ts = now_local_str()
+    # читаем через безопасный парсер (во избежание дублей заголовков)
+    try:
+        rows = _get_all_records_safe(ws)
+    except Exception as e:
+        logger.warning(f"_get_all_records_safe(users) упал: {e}")
+        rows = []
+    if not rows:
+        logger.info("Лист 'Пользователи' пуст — доступ разрешён всем.")
+        return set(), set(), set()
 
-    values_by_key = {
-        "дата": ts, "timestamp": ts,
-        "id": user.id, "user_id": user.id,
-        "имя": display_name, "name": display_name,
-        "тип": str(part.get("тип", "")), "type": str(part.get("тип", "")),
-        "наименование": str(part.get("наименование", "")), "name_item": str(part.get("наименование", "")),
-        "код": str(part.get("код", "")), "code": str(part.get("код", "")),
-        "数量": str(quantity), "количество": str(quantity), "qty": str(quantity),
-        "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
-    }
+    allowed, admins, blocked = set(), set(), set()
 
-    row = [values_by_key.get(hn, "") for hn in norm]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    logger.info("💾 Списание записано в 'История'")
+    for row in rows:
+        # нормализуем ключи
+        r = {str(k).strip().lower(): v for k, v in row.items()}
 
-async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-
-    if q.data == "confirm_yes":
-        st = issue_state.get(uid)
-        if not st or "part" not in st or "quantity" not in st:
-            issue_state.pop(uid, None)
-            return await q.message.reply_text("Данных для списания нет. Начните заново.")
-        part = st["part"]
-        qty = st["quantity"]
-        comment = st.get("comment", "")
-
-        await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
-        issue_state.pop(uid, None)
-
-        await q.message.reply_text(
-            f"✅ Списано: {qty}\n"
-            f"🔢 Код: {val(part, 'код')}\n"
-            f"📦 Наименование: {val(part, 'наименование')}\n"
-            f"💬 Комментарий: {comment or '—'}"
+        uid = (
+            _to_int_or_none(r.get("user_id"))
+            or _to_int_or_none(r.get("userid"))
+            or _to_int_or_none(r.get("id"))
+            or _to_int_or_none(r.get("uid"))
+            or _to_int_or_none(r.get("телеграм id"))
+            or _to_int_or_none(r.get("пользователь"))
         )
-        return ConversationHandler.END
+        if not uid:
+            continue
 
-    if q.data == "confirm_no":
-        issue_state.pop(uid, None)
-        await q.message.reply_text("❌ Списание отменено.")
-        return ConversationHandler.END
+        role = str(r.get("role") or r.get("роль") or "").strip().lower()
+        is_admin = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
+        is_allowed = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
+        is_blocked = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
 
-async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    if uid in issue_state:
-        issue_state.pop(uid, None)
-        await q.message.reply_text("❌ Операция списания отменена.")
-    return ConversationHandler.END
+        if is_blocked:
+            blocked.add(uid)
+        if is_admin:
+            admins.add(uid)
+            is_allowed = True
+        if is_allowed:
+            allowed.add(uid)
 
-async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cancel_cmd(update, context)
-    return ConversationHandler.END
-
-async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    if results is None or results.empty:
-        return await q.message.reply_text("Сначала выполните поиск.")
-    st["page"] = st.get("page", 0) + 1
-    chat_id = q.message.chat.id
-    await send_page_via_bot(context.bot, chat_id, uid)
-
-# --------------------- Регистрация хендлеров -----------------
-def register_handlers(app):
-    # гварды
-    app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
-    app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
-
-    # команды и меню
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("more", more_cmd))
-    app.add_handler(CommandHandler("export", export_cmd))
-    app.add_handler(CommandHandler("reload", reload_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-
-    # кнопки меню
-    app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
-    app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
-    app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
-
-    # пагинация
-    app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
-    app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
-
-    # диалог списания
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
-        states={
-            ASK_QUANTITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
-            ],
-            ASK_COMMENT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
-            ],
-            ASK_CONFIRM: [
-                CallbackQueryHandler(handle_confirm, pattern=r"^confirm_(yes|no)$"),
-                CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$")
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
-        allow_reentry=True,
-        per_chat=True,
-        per_user=True,
-        per_message=False,
-    )
-    app.add_handler(conv)
-
-    # поиск — регистрируем после диалога
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
+    logger.info(f"Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    return allowed, admins, blocked
