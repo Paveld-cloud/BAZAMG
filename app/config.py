@@ -7,8 +7,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 # Google Sheets
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "").strip()
 
-# Сервис-аккаунт: поддерживаем ОДНОВРЕМЕННО оба имени переменной,
-# чтобы код мог импортировать любой вариант.
+# Поддерживаем оба варианта переменной с JSON ключом сервис-аккаунта
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 CREDS_JSON = GOOGLE_APPLICATION_CREDENTIALS_JSON or os.getenv("CREDS_JSON", "").strip()
 
@@ -42,6 +41,4 @@ DATA_TTL = int(os.getenv("DATA_TTL", "300"))
 USERS_TTL = int(os.getenv("USERS_TTL", "300"))
 
 # Поля, по которым строим индекс поиска
-SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
-
-# ----------
+SEARCH_FIELDS = ["тип"]()_
