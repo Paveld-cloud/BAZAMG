@@ -64,7 +64,6 @@ async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
 
 # --------------------- Пользователи: допуски -----------------
 async def ensure_users_async(force: bool = False):
-    from app.data import SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
     # просто триггернём пере-загрузку через load_users_from_sheet
     allowed, admins, blocked = await asyncio.to_thread(load_users_from_sheet)
     SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
@@ -142,7 +141,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
 
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
+        f"<b>Бот для поиска и списания деталей</b>\n"
         f"────────\n"
         f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
         f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
@@ -152,9 +151,32 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     )
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
+# --------------------- Кнопки меню из приветствия -----------------
+async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+
+async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = (
+        "<b>Как списать деталь</b>:\n"
+        "1) Выполните поиск по названию/коду.\n"
+        "2) В карточке нажмите «📦 Взять деталь».\n"
+        "3) Укажите количество и комментарий.\n"
+        "4) Подтвердите списание кнопкой «Да»."
+    )
+    await _safe_send_html_message(context.bot, q.message.chat_id, msg)
+
+async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(f"{SUPPORT_CONTACT}")
+
 # --------------------- Фото карточки -----------------
 async def send_row_with_image(update: Update, row: dict, text: str):
-    from app.data import resolve_image_url_async, find_image_by_code_async
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
@@ -170,7 +192,6 @@ async def send_row_with_image(update: Update, row: dict, text: str):
     await update.message.reply_text(text, reply_markup=kb)
 
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
-    from app.data import resolve_image_url_async, find_image_by_code_async
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
@@ -204,7 +225,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from app.data import _safe_col  # not used but kept for parity
     msg = (
         "<b>Как пользоваться</b>:\n"
         "1) Выполните поиск по названию/модели/коду.\n"
@@ -218,7 +238,6 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return await update.message.reply_text("Доступ запрещён.")
-    from app.data import ensure_fresh_data, ensure_fresh_data_async
     ensure_fresh_data(force=True)
     ensure_users(force=True)
     await update.message.reply_text("✅ Данные и пользователи перезагружены (в фоне).")
@@ -231,19 +250,18 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активной операции.")
 
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from app.data import _df_to_xlsx
     uid = update.effective_user.id
     st = user_state.get(uid, {})
     results = st.get("results")
     if results is None or results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
-    import datetime, io
+    import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
+        from app.data import _df_to_xlsx
         buf = await asyncio.to_thread(_df_to_xlsx, results, f"export_{timestamp}.xlsx")
         await update.message.reply_document(InputFile(buf, filename=f"export_{timestamp}.xlsx"))
     except Exception as e:
-        import pandas as pd
         logger.warning(f"Не удалось XLSX (fallback CSV): {e}")
         csv = results.to_csv(index=False, encoding="utf-8-sig")
         await update.message.reply_document(
@@ -252,7 +270,6 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- Поиск -----------------
 async def send_page(update: Update, uid: int):
-    from app.data import df
     st = user_state.get(uid, {})
     results = st.get("results")
     page = st.get("page", 0)
@@ -275,7 +292,6 @@ async def send_page(update: Update, uid: int):
         await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
 
 async def send_page_via_bot(bot, chat_id: int, uid: int):
-    from app.data import df
     st = user_state.get(uid, {})
     results = st.get("results")
     page = st.get("page", 0)
@@ -296,7 +312,6 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
         await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from app.data import df, ensure_fresh_data_async, match_row_by_index, _safe_col, _relevance_score, normalize, squash
     from pandas import Series
     if update.message is None:
         return
@@ -396,7 +411,6 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ Списание -----------------
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from app.data import df
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -461,7 +475,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_CONFIRM
 
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    from app.data import get_gs_client, SPREADSHEET_URL, now_local_str
+    from app.data import get_gs_client, SPREADSHEET_URL
     import gspread
     client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
@@ -560,6 +574,11 @@ def register_handlers(app):
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+
+    # Кнопки меню приветствия
+    app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
+    app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
+    app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
 
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
