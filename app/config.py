@@ -41,4 +41,20 @@ DATA_TTL = int(os.getenv("DATA_TTL", "300"))
 USERS_TTL = int(os.getenv("USERS_TTL", "300"))
 
 # Поля, по которым строим индекс поиска
-SEARCH_FIELDS = ["тип"]()_
+SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
+
+# ---------------------- АДМИНЫ ----------------------
+def _parse_admins(s: str):
+    out = set()
+    for piece in (s or "").replace(";", ",").split(","):
+        p = piece.strip()
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            pass
+    return out
+
+# ENV пример: ADMINS="123,456"
+ADMINS = _parse_admins(os.getenv("ADMINS", "225177765"))
