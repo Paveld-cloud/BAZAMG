@@ -1,60 +1,51 @@
 # app/config.py
 import os
 
-# ---------------------- БАЗОВОЕ ----------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+def _truthy(x: str | None) -> bool:
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "y", "да", "ok", "ок"} or (s.isdigit() and int(s) > 0)
 
-# Google Sheets
-SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "").strip()
+# --- Бот / вебхук
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL", "") or "").rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
 
-# Поддерживаем оба варианта переменной с JSON ключом сервис-аккаунта
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
-CREDS_JSON = GOOGLE_APPLICATION_CREDENTIALS_JSON or os.getenv("CREDS_JSON", "").strip()
-
+# --- Google Sheets
+SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "")
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "{}")
 SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
 
-# Webhook
-WEBHOOK_URL = (os.getenv("WEBHOOK_URL", "").strip()).rstrip("/")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
-PORT = int(os.getenv("PORT", "8080"))
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
-
-# Прочее
-TZ_NAME = os.getenv("TIMEZONE", "Asia/Tashkent").strip()
+# --- Поведение бота
+TZ_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "5"))
 MAX_QTY = float(os.getenv("MAX_QTY", "1000"))
 
-# Приветствие/медиа/контакты
-WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()  # gif/mp4/file_id
-WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()          # url/file_id
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support").strip()
-
-# Можно оставить пустым или заменить на свой file_id
-WELCOME_MEDIA_ID = os.getenv(
-    "WELCOME_MEDIA_ID",
-    "AgACAgIAAxkBAAIPVGieF335h6r2xO6EvVxMTTatIs7VAAJg-zEbBUHwSAgsrYCCYGWiAQADAgADeQADNgQ"
-).strip()
-
-# ---------------------- КОНСТАНТЫ ----------------------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# --- Кеши
 DATA_TTL = int(os.getenv("DATA_TTL", "300"))
 USERS_TTL = int(os.getenv("USERS_TTL", "300"))
 
-# Поля, по которым строим индекс поиска
+# --- Поиск
 SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изготовитель"]
 
-# ---------------------- АДМИНЫ ----------------------
-def _parse_admins(s: str):
-    out = set()
-    for piece in (s or "").replace(";", ",").split(","):
-        p = piece.strip()
-        if not p:
-            continue
-        try:
-            out.add(int(p))
-        except Exception:
-            pass
-    return out
+# --- Мультимедиа приветствия
+WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()
+WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()
+WELCOME_MEDIA_ID = os.getenv("WELCOME_MEDIA_ID", "").strip()
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @your_support")
 
-# ENV пример: ADMINS="123,456"
-ADMINS = _parse_admins(os.getenv("ADMINS", "225177765"))
+# --- Админы (через ENV ADMINS="123,456")
+ADMINS = set()
+_adm_env = os.getenv("ADMINS", "")
+if _adm_env:
+    for p in _adm_env.replace(" ", "").split(","):
+        if p.isdigit():
+            ADMINS.add(int(p))
+
+# --- Режим сопоставления фото
+# 1 = строго: фото только если код содержится в URL
+# 0 = мягко: код -> image из строки (как раньше)
+IMAGE_STRICT = _truthy(os.getenv("IMAGE_STRICT", "1"))
