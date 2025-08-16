@@ -3,7 +3,6 @@ import os
 import re
 import io
 import json
-import math
 import time
 import asyncio
 import logging
@@ -84,7 +83,6 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
     for col in SEARCH_FIELDS:
         if col not in df.columns:
             continue
-        # .items() чтобы вернуть (idx, value)
         for idx, val in df[col].astype(str).str.lower().items():
             for t in re.findall(r'\w+', val):
                 if t:
@@ -300,7 +298,6 @@ def _read_users_rows(ws) -> list[dict]:
         headers_norm.append(key)
     rows: list[dict] = []
     for r in vals[1:]:
-        # выравнивание длины
         if len(r) < len(headers_norm):
             r = r + [""] * (len(headers_norm) - len(r))
         elif len(r) > len(headers_norm):
@@ -321,7 +318,6 @@ def load_users_from_sheet():
             return set(), set(), set()
 
     try:
-        # Пытаемся быстрым способом
         rows = ws.get_all_records()
     except Exception as e:
         logger.warning(f"get_all_records не сработал ({e}), fallback на ручной парсинг.")
@@ -341,7 +337,7 @@ def load_users_from_sheet():
             or _to_int_or_none(r.get("uid"))
             or _to_int_or_none(r.get("телеграм id"))
             or _to_int_or_none(r.get("пользователь"))
-            or _to_int_or_none(r.get("col_0"))  # на крайний случай
+            or _to_int_or_none(r.get("col_0"))
         )
         if not uid:
             continue
@@ -385,7 +381,6 @@ def ensure_users(force: bool = False):
 # ---------------------- Экспорт ----------------------
 def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf = io.BytesIO()
-    # openpyxl должен быть в requirements
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
     buf.seek(0)
