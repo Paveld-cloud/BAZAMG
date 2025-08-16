@@ -1,32 +1,38 @@
+# app/handlers.py
 import io
 import math
 import asyncio
 import logging
 from html import escape
+
 from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters, ApplicationHandlerStop
 )
 
+# берем конфиг
 from app.config import (
-    PAGE_SIZE, MAX_QTY, WELCOME_ANIMATION_URL, WELCOME_PHOTO_URL,
-    SUPPORT_CONTACT, WELCOME_MEDIA_ID
+    PAGE_SIZE, MAX_QTY,
+    WELCOME_ANIMATION_URL, WELCOME_PHOTO_URL, SUPPORT_CONTACT, WELCOME_MEDIA_ID,
 )
+
+# ВАЖНО: импортируем модуль целиком, чтобы всегда видеть АКТУАЛЬНЫЙ df
+import app.data as data
+
+# используем только функции/структуры (без df)
 from app.data import (
-    df, user_state, issue_state,
+    user_state, issue_state,
     ensure_fresh_data, ensure_fresh_data_async,
     format_row, normalize, squash, match_row_by_index, _safe_col, _relevance_score,
     find_image_by_code_async, resolve_image_url_async,
-    val, now_local_str,
+    val, now_local_str, get_gs_client,
     load_users_from_sheet, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED,
-    user_state as _user_state_global,
-    issue_state as _issue_state_global,
-    ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM
+    ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM,
+    is_admin, is_allowed, _df_to_xlsx,
 )
-
-# локальные ADMINS через config
-from app.config import ADMINS
+from app.config import ADMINS  # локальные админы из конфига
+from app.config import SPREADSHEET_URL  # ссылка на таблицу для истории
 
 logger = logging.getLogger("bot.handlers")
 
@@ -56,29 +62,27 @@ async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
     except Exception as e:
-        logger.warning(f"HTML message parse failed, fallback to plain: {e}")
+        logger.warning(f"HTML parse failed, fallback to plain: {e}")
         import re
         no_tags = re.sub(r"</?(b|i|code)>", "", text)
         kwargs.pop("parse_mode", None)
         return await bot.send_message(chat_id=chat_id, text=no_tags, **kwargs)
 
-# --------------------- Пользователи: допуски -----------------
+# --------------------- Пользователи (допуски) -----------------
 async def ensure_users_async(force: bool = False):
-    # просто триггернём пере-загрузку через load_users_from_sheet
     allowed, admins, blocked = await asyncio.to_thread(load_users_from_sheet)
     SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
     SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
     SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
 
 def ensure_users(force: bool = False):
-    # fire-and-forget
     asyncio.create_task(ensure_users_async(force=True))
 
-def is_admin(uid: int) -> bool:
+def is_admin_local(uid: int) -> bool:
     ensure_users()
     return uid in SHEET_ADMINS or uid in ADMINS
 
-def is_allowed(uid: int) -> bool:
+def is_allowed_local(uid: int) -> bool:
     ensure_users()
     if uid in SHEET_BLOCKED:
         return False
@@ -89,7 +93,7 @@ def is_allowed(uid: int) -> bool:
 # --------------------- Гварды -----------------
 async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user and not is_allowed(user.id):
+    if user and not is_allowed_local(user.id):
         try:
             await update.effective_message.reply_text("Доступ запрещён.")
         except Exception:
@@ -98,7 +102,7 @@ async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user and not is_allowed(user.id):
+    if user and not is_allowed_local(user.id):
         try:
             await update.callback_query.answer("Доступ запрещён.", show_alert=True)
         except Exception:
@@ -111,6 +115,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
+    # 1) анимация (если это реально gif/mp4; фото сюда не подойдёт)
     if WELCOME_ANIMATION_URL:
         try:
             await context.bot.send_animation(
@@ -122,6 +127,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
 
+    # 2) фото по file_id (надежнее всего)
     sent_media = False
     if WELCOME_MEDIA_ID:
         try:
@@ -131,6 +137,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by file_id failed: {e}")
 
+    # 3) фото по URL
     if not sent_media and WELCOME_PHOTO_URL:
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
@@ -139,9 +146,10 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome photo by URL/file_id failed: {e}")
 
+    # 4) карточка
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n"
-        f"<b>Бот для поиска и списания деталей</b>\n"
+        f"<i>Инженерный бот для поиска и списания деталей</i>\n"
         f"────────\n"
         f"• Введите <code>название</code>, <code>код</code> или <code>модель</code>\n"
         f"• Откройте карточку и нажмите «📦 Взять деталь»\n"
@@ -151,7 +159,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     )
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
-# --------------------- Кнопки меню из приветствия -----------------
+# callbacks из приветственного меню
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -177,6 +185,7 @@ async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- Фото карточки -----------------
 async def send_row_with_image(update: Update, row: dict, text: str):
+    # показываем фото ТОЛЬКО если нашли по коду (не из строки «image»)
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
@@ -236,7 +245,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin_local(uid):
         return await update.message.reply_text("Доступ запрещён.")
     ensure_fresh_data(force=True)
     ensure_users(force=True)
@@ -258,7 +267,6 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        from app.data import _df_to_xlsx
         buf = await asyncio.to_thread(_df_to_xlsx, results, f"export_{timestamp}.xlsx")
         await update.message.reply_document(InputFile(buf, filename=f"export_{timestamp}.xlsx"))
     except Exception as e:
@@ -268,7 +276,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{timestamp}.csv")
         )
 
-# --------------------- Поиск -----------------
+# --------------------- Разбивка результатов на страницы -----------------
 async def send_page(update: Update, uid: int):
     st = user_state.get(uid, {})
     results = st.get("results")
@@ -282,13 +290,13 @@ async def send_page(update: Update, uid: int):
         st["page"] = pages - 1
         return await update.message.reply_text("Больше результатов нет.")
 
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total)
+    start_i = page * PAGE_SIZE
+    end_i = min(start_i + PAGE_SIZE, total)
 
-    await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
-    for _, row in results.iloc[start:end].iterrows():
+    await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start_i + 1}–{end_i} из {total}.")
+    for _, row in results.iloc[start_i:end_i].iterrows():
         await send_row_with_image(update, row.to_dict(), format_row(row.to_dict()))
-    if end < total:
+    if end_i < total:
         await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
 
 async def send_page_via_bot(bot, chat_id: int, uid: int):
@@ -302,20 +310,21 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
     if page >= pages:
         st["page"] = pages - 1
         return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total)
-    await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
-    chunk = results.iloc[start:end]
+    start_i = page * PAGE_SIZE
+    end_i = min(start_i + PAGE_SIZE, total)
+    await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start_i + 1}–{end_i} из {total}.")
+    chunk = results.iloc[start_i:end_i]
     for _, row in chunk.iterrows():
         await send_row_with_image_bot(bot, chat_id, row.to_dict(), format_row(row.to_dict()))
-    if end < total:
+    if end_i < total:
         await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
 
+# --------------------- Поиск -----------------
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from pandas import Series
     if update.message is None:
         return
 
+    # подавим ложный поиск во время диалога списания
     if context.chat_data.pop("suppress_next_search", False):
         return
 
@@ -333,7 +342,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=cancel_markup()
             )
 
-    q = update.message.text.strip()
+    q = (update.message.text or "").strip()
     if not q:
         return await update.message.reply_text("Введите запрос.")
     tokens = normalize(q).split()
@@ -341,42 +350,44 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Введите более конкретный запрос.")
     q_squash = squash(q)
 
-    if df is None:
+    # ЖИВОЙ доступ к df
+    if data.df is None:
         await ensure_fresh_data_async(force=True)
-        from app.data import df as df2
-        if df2 is None:
+        if data.df is None:
             return await update.message.reply_text("Ошибка загрузки данных.")
+    cur_df = data.df
 
     matched_indices = match_row_by_index(tokens)
 
+    from pandas import Series
     if not matched_indices:
-        mask_any = Series(False, index=df.index)
+        mask_any = Series(False, index=cur_df.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
-            series = _safe_col(df, col)
+            series = _safe_col(cur_df, col)
             if series is None:
                 continue
-            field_mask = Series(True, index=df.index)
+            field_mask = Series(True, index=cur_df.index)
             for t in tokens:
                 if t:
                     field_mask &= series.str.contains(t, na=False)
             mask_any |= field_mask
-        matched_indices = set(df.index[mask_any])
+        matched_indices = set(cur_df.index[mask_any])
 
     if not matched_indices and q_squash:
-        mask_any = Series(False, index=df.index)
+        mask_any = Series(False, index=cur_df.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
-            series = _safe_col(df, col)
+            series = _safe_col(cur_df, col)
             if series is None:
                 continue
             series_sq = series.str.replace(r'[\W_]+', '', regex=True)
             mask_any |= series_sq.str.contains(q_squash, na=False)
-        matched_indices = set(df.index[mask_any])
+        matched_indices = set(cur_df.index[mask_any])
 
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
     idx_list = list(matched_indices)
-    results_df = df.loc[idx_list].copy()
+    results_df = cur_df.loc[idx_list].copy()
 
     scores = []
     for _, r in results_df.iterrows():
@@ -400,25 +411,17 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_page(update, uid)
 
-async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    st = user_state.get(uid, {})
-    results = st.get("results")
-    if results is None or results.empty:
-        return await update.message.reply_text("Сначала выполните поиск.")
-    st["page"] = st.get("page", 0) + 1
-    await send_page(update, uid)
-
-# ------------------ Списание -----------------
+# ------------------ Списание (диалог) -----------------
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     code = q.data.split(":", 1)[1].strip().lower()
 
+    cur_df = data.df
     found = None
-    if df is not None and "код" in df.columns:
-        hit = df[df["код"].astype(str).str.lower() == code]
+    if cur_df is not None and "код" in cur_df.columns:
+        hit = cur_df[cur_df["код"].astype(str).str.lower() == code]
         if not hit.empty:
             found = hit.iloc[0].to_dict()
 
@@ -430,6 +433,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_QUANTITY
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["suppress_next_search"] = True
     uid = update.effective_user.id
     text = (update.message.text or "").strip().replace(",", ".")
     try:
@@ -451,6 +455,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["suppress_next_search"] = True
     uid = update.effective_user.id
     comment = (update.message.text or "").strip()
     st = issue_state.get(uid)
@@ -475,7 +480,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_CONFIRM
 
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    from app.data import get_gs_client, SPREADSHEET_URL
     import gspread
     client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
@@ -565,24 +569,28 @@ async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- Регистрация хендлеров -----------------
 def register_handlers(app):
+    # гварды
     app.add_handler(MessageHandler(filters.ALL, guard_msg), group=-1)
     app.add_handler(CallbackQueryHandler(guard_cb, pattern=".*"), group=-1)
 
+    # команды и меню
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("more", more_cmd))
+    app.add_handler(CommandHandler("more", export_cmd))  # опечатка? оставим только /export и /more ниже
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Кнопки меню приветствия
+    # кнопки меню
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
     app.add_handler(CallbackQueryHandler(menu_issue_help_cb, pattern=r"^menu_issue_help$"))
     app.add_handler(CallbackQueryHandler(menu_contact_cb, pattern=r"^menu_contact$"))
 
+    # пагинация
     app.add_handler(CallbackQueryHandler(on_more_click, pattern=r"^more$"))
     app.add_handler(CallbackQueryHandler(cancel_action, pattern=r"^cancel_action$"))
 
+    # диалог списания
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_issue_click, pattern=r"^issue:")],
         states={
@@ -607,4 +615,5 @@ def register_handlers(app):
     )
     app.add_handler(conv)
 
+    # сам поиск — РЕГИСТРИРУЕМ ПОСЛЕ диалога
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
