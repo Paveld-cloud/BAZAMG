@@ -1,5 +1,4 @@
 # app/data.py
-import os
 import re
 import io
 import json
@@ -23,12 +22,13 @@ from app.config import (
     TZ_NAME,
     DATA_TTL,
     USERS_TTL,
-    SEARCH_FIELDS,  # ["тип","наименование","код","oem","изготовитель"]
+    SEARCH_FIELDS,
+    IMAGE_STRICT,
 )
 
 logger = logging.getLogger("bot.data")
 
-# ---------------------- Глобальные состояния ----------------------
+# ======================= Глобальные состояния =======================
 df: Optional[DataFrame] = None
 _last_load_ts = 0.0
 _search_index: Optional[Dict[str, Set[int]]] = None
@@ -45,19 +45,18 @@ issue_state: Dict[int, Dict[str, Any]] = {}
 _loading_data = False
 _loading_users = False
 
-# Conversation states (должны совпадать с handlers)
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# ---------------------- Время ----------------------
+# ======================= Время =======================
 def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     try:
         return datetime.now(ZoneInfo(TZ_NAME)).strftime(fmt)
     except Exception:
         return datetime.utcnow().strftime(fmt)
 
-# ---------------------- Google Sheets ----------------------
+# ======================= Sheets =======================
 def get_gs_client():
     creds_info = json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -77,7 +76,7 @@ def load_data_blocking() -> list[dict]:
     ws = _open_data_worksheet(client)
     return ws.get_all_records()
 
-# ---------------------- Поисковый индекс ----------------------
+# ======================= Поиск =======================
 def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
     index: DefaultDict[str, Set[int]] = defaultdict(set)
     for col in SEARCH_FIELDS:
@@ -89,7 +88,6 @@ def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
                     index[t].add(idx)
     return dict(index)
 
-# ---------------------- Утилиты ----------------------
 def val(row: dict, key: str, default: str = "—") -> str:
     v = row.get(key)
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -146,7 +144,7 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
             break
     return result or set()
 
-# ---------------------- Работа с картинками ----------------------
+# ======================= Картинки =======================
 def _norm_code(c: str) -> tuple[str, str]:
     raw = (c or "").strip().lower()
     squash_ = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
@@ -166,25 +164,19 @@ def normalize_drive_url(url: str) -> str:
         return f'https://drive.google.com/uc?export=download&id={file_id}'
     return url
 
-async def resolve_image_url_async(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
-        return u
-    if "drive.google.com" in u:
-        return normalize_drive_url(u)
-    return u
-
 def build_image_index(df: pd.DataFrame) -> dict[str, str]:
     """
-    Индексируем ТОЛЬКО те ссылки, где код встречается в самом URL (путь/квери).
-    Никаких фолбэков «взять картинку из строки».
+    Индекс фотографий.
+    - Если IMAGE_STRICT=1: индексируем только те URL, где код встречается в самом URL.
+    - Если IMAGE_STRICT=0: каждую непустую пару код → image берём из строки.
     """
-    if "image" not in df.columns or "код" not in df.columns:
+    if "код" not in df.columns or "image" not in df.columns:
         return {}
 
     index: dict[str, str] = {}
     total = 0
     matched = 0
+
     for _, row in df.iterrows():
         total += 1
         code_val = str(row.get("код", "")).strip().lower()
@@ -193,14 +185,20 @@ def build_image_index(df: pd.DataFrame) -> dict[str, str]:
             continue
 
         raw, sq = _norm_code(code_val)
-        if _url_has_code(url, raw, sq):
+
+        ok = True
+        if IMAGE_STRICT:
+            ok = _url_has_code(url, raw, sq)
+
+        if ok:
             url_norm = normalize_drive_url(url)
-            if raw and raw not in index:
-                index[raw] = url_norm
-            if sq and sq not in index:
-                index[sq] = url_norm
+            for k in (raw, sq):
+                if k and k not in index:
+                    index[k] = url_norm
             matched += 1
-    logger.info(f"image-index: совпадений по URL={matched} из {total}")
+
+    mode = "STRICT(URL)" if IMAGE_STRICT else "ROW-MAP"
+    logger.info(f"image-index[{mode}]: добавлено {matched} из {total} строк")
     return index
 
 async def find_image_by_code_async(code: str) -> str:
@@ -209,14 +207,22 @@ async def find_image_by_code_async(code: str) -> str:
     raw, sq = _norm_code(code)
     return _image_index.get(raw) or _image_index.get(sq, "") or ""
 
-# ---------------------- Загрузка данных ----------------------
+async def resolve_image_url_async(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return u
+    if "drive.google.com" in u:
+        return normalize_drive_url(u)
+    return u
+
+# ======================= Загрузка / перезагрузка =======================
 def initial_load():
     global df, _last_load_ts, _search_index, _image_index
     data = load_data_blocking()
     new_df = DataFrame(data)
     new_df.columns = new_df.columns.str.strip().str.lower()
 
-    # нормализуем код/оем и image
+    # нормализация
     for col in ("код", "oem"):
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).str.strip().str.lower()
@@ -265,7 +271,7 @@ def ensure_fresh_data(force: bool = False):
         return
     asyncio.create_task(ensure_fresh_data_async(force=True))
 
-# ---------------------- Users sheet ----------------------
+# ======================= Users =======================
 def _truthy(x) -> bool:
     s = str(x).strip().lower()
     return s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок", "allowed", "разрешен", "разрешено"} or (s.isdigit() and int(s) > 0)
@@ -283,7 +289,6 @@ def _to_int_or_none(x):
         return None
 
 def _read_users_rows(ws) -> list[dict]:
-    """Надёжно читает лист с любыми (даже пустыми/дублирующимися) заголовками."""
     vals = ws.get_all_values()
     if not vals:
         return []
@@ -378,7 +383,7 @@ def ensure_users(force: bool = False):
         return
     asyncio.create_task(ensure_users_async(force=True))
 
-# ---------------------- Экспорт ----------------------
+# ======================= Экспорт =======================
 def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
