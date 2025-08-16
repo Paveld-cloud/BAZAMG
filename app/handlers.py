@@ -11,28 +11,26 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters, ApplicationHandlerStop
 )
 
-# берем конфиг
+# конфиг
 from app.config import (
     PAGE_SIZE, MAX_QTY,
     WELCOME_ANIMATION_URL, WELCOME_PHOTO_URL, SUPPORT_CONTACT, WELCOME_MEDIA_ID,
+    SPREADSHEET_URL, ADMINS
 )
 
-# ВАЖНО: импортируем модуль целиком, чтобы всегда видеть АКТУАЛЬНЫЙ df
+# ВАЖНО: модуль целиком — для «живого» доступа к df
 import app.data as data
 
-# используем только функции/структуры (без df)
+# функции/структуры из data (без df)
 from app.data import (
     user_state, issue_state,
     ensure_fresh_data, ensure_fresh_data_async,
     format_row, normalize, squash, match_row_by_index, _safe_col, _relevance_score,
     find_image_by_code_async, resolve_image_url_async,
-    val, now_local_str, get_gs_client,
+    val, now_local_str, get_gs_client, _df_to_xlsx,
     load_users_from_sheet, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED,
     ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM,
-    is_admin, is_allowed, _df_to_xlsx,
 )
-from app.config import ADMINS  # локальные админы из конфига
-from app.config import SPREADSHEET_URL  # ссылка на таблицу для истории
 
 logger = logging.getLogger("bot.handlers")
 
@@ -115,7 +113,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # 1) анимация (если это реально gif/mp4; фото сюда не подойдёт)
+    # 1) анимация (gif/mp4). Фото сюда не подойдёт.
     if WELCOME_ANIMATION_URL:
         try:
             await context.bot.send_animation(
@@ -127,7 +125,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
 
-    # 2) фото по file_id (надежнее всего)
+    # 2) фото по file_id
     sent_media = False
     if WELCOME_MEDIA_ID:
         try:
@@ -185,7 +183,7 @@ async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --------------------- Фото карточки -----------------
 async def send_row_with_image(update: Update, row: dict, text: str):
-    # показываем фото ТОЛЬКО если нашли по коду (не из строки «image»)
+    # показываем фото ТОЛЬКО если нашли по коду (не берём из столбца строки)
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
@@ -275,6 +273,15 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             InputFile(io.BytesIO(csv.encode("utf-8-sig")), filename=f"export_{timestamp}.csv")
         )
+
+async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    st = user_state.get(uid, {})
+    results = st.get("results")
+    if results is None or results.empty:
+        return await update.message.reply_text("Сначала выполните поиск.")
+    st["page"] = st.get("page", 0) + 1
+    await send_page(update, uid)
 
 # --------------------- Разбивка результатов на страницы -----------------
 async def send_page(update: Update, uid: int):
@@ -576,7 +583,7 @@ def register_handlers(app):
     # команды и меню
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("more", export_cmd))  # опечатка? оставим только /export и /more ниже
+    app.add_handler(CommandHandler("more", more_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
@@ -615,5 +622,5 @@ def register_handlers(app):
     )
     app.add_handler(conv)
 
-    # сам поиск — РЕГИСТРИРУЕМ ПОСЛЕ диалога
+    # поиск — регистрируем после диалога
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
