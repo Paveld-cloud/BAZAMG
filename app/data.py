@@ -250,4 +250,144 @@ async def ensure_fresh_data_async(force: bool = False):
         new_df.columns = new_df.columns.str.strip().str.lower()
         for col in ("код", "oem"):
             if col in new_df.columns:
-                new_df[col] = new_df[col].astype(str).str
+                new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+        if "image" in new_df.columns:
+            new_df["image"] = new_df["image"].astype(str).str.strip()
+
+        df = new_df
+        _search_index = build_search_index(df)
+        _image_index = build_image_index(df)
+        _last_load_ts = time.time()
+        logger.info(f"✅ Перезагружено {len(df)} строк и индексы")
+    finally:
+        _loading_data = False
+
+def ensure_fresh_data(force: bool = False):
+    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
+        return
+    asyncio.create_task(ensure_fresh_data_async(force=True))
+
+# ---------------------- Users sheet ----------------------
+def _truthy(x) -> bool:
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "y", "да", "истина", "ok", "ок", "allowed", "разрешен", "разрешено"} or (s.isdigit() and int(s) > 0)
+
+def _to_int_or_none(x):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        return int(m.group(0)) if m else None
+    except Exception:
+        return None
+
+def _read_users_rows(ws) -> list[dict]:
+    """Надёжно читает лист с любыми (даже пустыми/дублирующимися) заголовками."""
+    vals = ws.get_all_values()
+    if not vals:
+        return []
+    headers_raw = [h.strip() for h in vals[0]]
+    seen = set()
+    headers_norm = []
+    for i, h in enumerate(headers_raw):
+        key = h.strip().lower()
+        if not key or key in seen:
+            key = f"col_{i}"
+        seen.add(key)
+        headers_norm.append(key)
+    rows: list[dict] = []
+    for r in vals[1:]:
+        # выравнивание длины
+        if len(r) < len(headers_norm):
+            r = r + [""] * (len(headers_norm) - len(r))
+        elif len(r) > len(headers_norm):
+            r = r[: len(headers_norm)]
+        rows.append({headers_norm[i]: r[i] for i in range(len(headers_norm))})
+    return rows
+
+def load_users_from_sheet():
+    client = get_gs_client()
+    sh = client.open_by_url(SPREADSHEET_URL)
+    try:
+        ws = sh.worksheet("Пользователи")
+    except gspread.WorksheetNotFound:
+        try:
+            ws = sh.worksheet("Users")
+        except gspread.WorksheetNotFound:
+            logger.info("Лист 'Пользователи' не найден — доступ разрешён всем.")
+            return set(), set(), set()
+
+    try:
+        # Пытаемся быстрым способом
+        rows = ws.get_all_records()
+    except Exception as e:
+        logger.warning(f"get_all_records не сработал ({e}), fallback на ручной парсинг.")
+        rows = _read_users_rows(ws)
+
+    if not rows:
+        logger.info("Лист 'Пользователи' пуст — доступ разрешён всем.")
+        return set(), set(), set()
+
+    allowed, admins, blocked = set(), set(), set()
+    for row in rows:
+        r = {str(k).strip().lower(): v for k, v in row.items()}
+        uid = (
+            _to_int_or_none(r.get("user_id"))
+            or _to_int_or_none(r.get("userid"))
+            or _to_int_or_none(r.get("id"))
+            or _to_int_or_none(r.get("uid"))
+            or _to_int_or_none(r.get("телеграм id"))
+            or _to_int_or_none(r.get("пользователь"))
+            or _to_int_or_none(r.get("col_0"))  # на крайний случай
+        )
+        if not uid:
+            continue
+
+        role = str(r.get("role") or r.get("роль") or "").strip().lower()
+        is_admin = role in {"admin", "админ", "administrator", "администратор"} or _truthy(r.get("admin"))
+        is_blocked = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
+        is_allowed = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
+
+        if is_blocked:
+            blocked.add(uid)
+        if is_admin:
+            admins.add(uid)
+            is_allowed = True
+        if is_allowed:
+            allowed.add(uid)
+
+    logger.info(f"Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    return allowed, admins, blocked
+
+async def ensure_users_async(force: bool = False):
+    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts, _loading_users
+    if not force and (time.time() - _last_users_ts <= USERS_TTL):
+        return
+    if _loading_users:
+        return
+    _loading_users = True
+    try:
+        allowed, admins, blocked = await asyncio.to_thread(load_users_from_sheet)
+        SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
+        _last_users_ts = time.time()
+        logger.info(f"👥 Пользователи: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    finally:
+        _loading_users = False
+
+def ensure_users(force: bool = False):
+    if not force and (time.time() - _last_users_ts <= USERS_TTL):
+        return
+    asyncio.create_task(ensure_users_async(force=True))
+
+# ---------------------- Экспорт ----------------------
+def _df_to_xlsx(df: DataFrame, name: str) -> io.BytesIO:
+    buf = io.BytesIO()
+    # openpyxl должен быть в requirements
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    buf.seek(0)
+    buf.name = name
+    return buf
