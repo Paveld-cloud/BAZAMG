@@ -17,7 +17,7 @@ from app.data import (
     df, user_state, issue_state,
     ensure_fresh_data, ensure_fresh_data_async,
     format_row, normalize, squash, match_row_by_index, _safe_col, _relevance_score,
-    find_image_by_code_async, resolve_image_url_async, _download_image_async if False else None,  # placeholder
+    find_image_by_code_async, resolve_image_url_async,
     val, now_local_str,
     load_users_from_sheet, SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED,
     user_state as _user_state_global,
