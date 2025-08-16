@@ -4,13 +4,13 @@ import re
 import io
 import json
 import time
-import math
 import asyncio
 import logging
 from typing import Optional, Dict, Any, Set, List, DefaultDict, Tuple
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, unquote
 
 import gspread
 import pandas as pd
@@ -57,7 +57,6 @@ def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
 
 # ---------------------- Google Sheets ----------------------
 def get_gs_client():
-    """Клиент gspread по JSON ключу из ENV."""
     creds_info = json.loads(CREDS_JSON or "{}")
     if not creds_info:
         raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON / CREDS_JSON пуст.")
@@ -147,29 +146,69 @@ def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
         score += weight * (2 * tok_hit + sub_hit) + 3 * squash_hit * weight
     return score
 
-# ---------------------- Картинки по коду ----------------------
+# ---------------------- Картинки по КОДУ (только если код в имени файла) ----------------------
 def _norm_code(c: str) -> Tuple[str, str]:
     raw = (c or "").strip().lower()
     squash_ = re.sub(r'[\W_]+', '', raw, flags=re.UNICODE)
     return raw, squash_
 
+def _filename_from_url(url: str) -> str:
+    """
+    Вытаскиваем имя файла из URL (без query). Для Google Drive (file_id) имени нет — вернём ''.
+    """
+    if not url:
+        return ""
+    url = url.strip()
+    if "drive.google.com" in url:
+        # Без доступа к API имени файла не узнать — пропускаем.
+        return ""
+    parsed = urlparse(url)
+    # часть пути без query/fragment
+    path = parsed.path or ""
+    fname = path.split("/")[-1]
+    fname = unquote(fname).lower()
+    # иногда код уходит в имя до расширения
+    return re.sub(r"\s+", " ", fname)
+
 def build_image_index(df: DataFrame) -> Dict[str, str]:
     """
-    Собираем индекс картинок по коду из столбца 'image' (если он есть).
-    Ключи: code raw и его 'squash'.
+    Индексируем ТОЛЬКО те картинки, у которых в названии файла явно встречается код.
+    Если в названии файла кода нет — НЕ индексируем вообще.
+    Это гарантирует: никакого «фото по строке», только «фото по коду в имени».
     """
     if "image" not in df.columns or "код" not in df.columns:
         return {}
+
     index: Dict[str, str] = {}
+    misses = 0
     for _, row in df.iterrows():
-        code_val = str(row.get("код", "")).strip()
+        code_val = str(row.get("код", "")).strip().lower()
         url = str(row.get("image", "")).strip()
         if not code_val or not url:
             continue
+
         raw, sq = _norm_code(code_val)
-        index[raw] = url
-        if sq and sq not in index:
-            index[sq] = url
+        fname = _filename_from_url(url)
+        if not fname:
+            # Невозможно проверить имя (например, Google Drive file_id) — пропускаем
+            misses += 1
+            continue
+
+        fname_sq = re.sub(r'[\W_]+', '', fname, flags=re.UNICODE)
+
+        # Индексируем только если код реально присутствует в имени файла
+        if (raw and raw in fname) or (sq and sq in fname_sq):
+            if raw not in index:
+                index[raw] = url
+            if sq and sq not in index:
+                index[sq] = url
+        else:
+            # Не совпало — пропускаем
+            continue
+
+    if misses:
+        logger.info(f"image-index: пропущено {misses} ссылок без имени файла (например, Google Drive).")
+    logger.info(f"image-index: построено {len(index)} соответствий (код -> url)")
     return index
 
 def normalize_drive_url(url: str) -> str:
@@ -181,8 +220,7 @@ def normalize_drive_url(url: str) -> str:
 
 async def resolve_image_url_async(u: str) -> str:
     """
-    Без внешних зависимостей: нормализуем только Google Drive.
-    (ibb.co и т.п. оставляем как есть)
+    Нормализуем только Google Drive (если вдруг в индексе оказалась drive-ссылка с fileId).
     """
     u = (u or "").strip()
     if not u:
@@ -217,9 +255,6 @@ def _to_int_or_none(x):
         return None
 
 def _rows_from_ws_with_fallback(ws) -> List[dict]:
-    """
-    Аккуратно читаем лист с возможными дубликатами/пустыми заголовками.
-    """
     try:
         rows = ws.get_all_records(expected_headers=[
             "user_id","userid","id","uid","телеграм id","пользователь",
@@ -232,16 +267,16 @@ def _rows_from_ws_with_fallback(ws) -> List[dict]:
         if not values:
             return []
         headers = [h.strip() for h in values[0]]
-        # Переименуем пустые/дубликаты
+        # починим пустые/дубликаты заголовков
         seen = {}
         norm_headers = []
         for i, h in enumerate(headers):
             key = h or f"col_{i+1}"
-            base = key
-            while key.lower() in seen:
-                key = f"{base}_{seen[key.lower()]+1}"
-                seen[key.lower()] = seen.get(key.lower(), 0) + 1
-            seen[key.lower()] = seen.get(key.lower(), 0)
+            low = key.lower()
+            cnt = seen.get(low, 0)
+            if cnt:
+                key = f"{key}_{cnt+1}"
+            seen[low] = cnt + 1
             norm_headers.append(key)
         out = []
         for row in values[1:]:
@@ -314,18 +349,16 @@ async def ensure_fresh_data_async(force: bool = False):
 
     df = new_df
     _search_index = build_search_index(df)
-    _image_index = build_image_index(df)
+    _image_index = build_image_index(df)   # <-- ключевое изменение
     _last_load_ts = time.time()
     logger.info(f"✅ Перезагружено {len(df)} строк и индексы")
 
 def ensure_fresh_data(force: bool = False):
-    """Fire-and-forget обновление (используется из хендлеров)."""
     if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
         return
     asyncio.create_task(ensure_fresh_data_async(force=True))
 
 def initial_load():
-    """Синхронная начальная загрузка (вызывается в main.py перед запуском бота)."""
     global df, _last_load_ts, _search_index, _image_index
     data = load_data_blocking()
     new_df = DataFrame(data)
@@ -338,11 +371,10 @@ def initial_load():
 
     df = new_df
     _search_index = build_search_index(df)
-    _image_index = build_image_index(df)
+    _image_index = build_image_index(df)   # <-- ключевое изменение
     _last_load_ts = time.time()
     logger.info(f"✅ Загружено (startup) {len(df)} строк и индексы")
 
-    # Пользователи (startup)
     allowed, admins, blocked = load_users_from_sheet()
     global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
     SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
@@ -351,18 +383,9 @@ def initial_load():
 
 # ---------------------- Экспорт XLSX ----------------------
 def _df_to_xlsx(df_in: DataFrame, name: str) -> io.BytesIO:
-    """
-    Создаёт in-memory XLSX для отправки пользователю.
-    """
     buf = io.BytesIO()
-    try:
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df_in.to_excel(w, index=False)
-        buf.seek(0)
-        buf.name = name
-        return buf
-    except Exception as e:
-        # Пусть вызывающая сторона решит, чем фоллбэкать
-        raise
-
-# ---------------------- Конец модуля ----------------------
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df_in.to_excel(w, index=False)
+    buf.seek(0)
+    buf.name = name
+    return buf
