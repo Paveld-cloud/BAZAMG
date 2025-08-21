@@ -103,48 +103,55 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    if WELCOME_ANIMATION_URL:
-        try:
+    # Красочное приветствие (текст)
+    card_html = (
+        f"⚙️ <b>Привет, {first}!</b>\n\n"
+        f"Добро пожаловать в <b>бот для поиска и списания деталей</b> 🛠️\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔍 <b>Что умеет бот?</b>\n"
+        f"• Поиск по <code>названию</code>, <code>коду</code> или <code>модели</code>\n"
+        f"• Просмотр карточек с описанием и фото 📸\n"
+        f"• Списание деталей с подтверждением ✅\n"
+        f"• Экспорт результатов в Excel 📊\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🧪 <b>Пример запроса:</b>\n"
+        f"<code>PI 8808 DRG 500</code>\n\n"
+        f"🚀 <i>Готов к работе — просто начните вводить!</i>"
+    )
+
+    # Отправляем медиа + текст одним сообщением (caption). Если не получилось — фолбэк на текст.
+    try:
+        if WELCOME_MEDIA_ID:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=WELCOME_MEDIA_ID,
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
+            )
+            return
+        if WELCOME_PHOTO_URL:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=WELCOME_PHOTO_URL,
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
+            )
+            return
+        if WELCOME_ANIMATION_URL:
             await context.bot.send_animation(
                 chat_id=chat_id,
                 animation=WELCOME_ANIMATION_URL,
-                caption=f"⚙️ Добро пожаловать, {first}!"
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
             )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.warning(f"Welcome animation failed: {e}")
+            return
+    except Exception as e:
+        logger.warning(f"Welcome message with media failed: {e}")
 
-    sent_media = False
-    if WELCOME_MEDIA_ID:
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, disable_notification=True)
-            sent_media = True
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.warning(f"Welcome photo by file_id failed: {e}")
-
-    if not sent_media and WELCOME_PHOTO_URL:
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, disable_notification=True)
-            sent_media = True
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.warning(f"Welcome photo by URL/file_id failed: {e}")
-
-    card_html = (
-    f"⚙️ <b>Привет, {first}!</b>\n\n"
-    f"Добро пожаловать в <b>бот для поиска и списания деталей</b> 🛠️\n\n"
-    f"━━━━━━━━━━━━━━━\n"
-    f"🔍 <b>Что умеет бот?</b>\n"
-    f"• Поиск по <code>названию</code>, <code>коду</code> или <code>модели</code>\n"
-    f"• Просмотр карточек с описанием и фото 📸\n"
-    f"• Списание деталей с подтверждением ✅\n"
-    f"• Экспорт результатов в Excel 📊\n\n"
-    f"━━━━━━━━━━━━━━━\n"
-    f"🧪 <b>Пример запроса:</b>\n"
-    f"<code>PI 8808 DRG 500</code>\n\n"
-    f"🚀 <i>Готов к работе — просто начните вводить!</i>"
-)
+    # Фолбэк: просто текст, если медиа не задано или не получилось отправить
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # --------------------- Фото карточки -----------------
