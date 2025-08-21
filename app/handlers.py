@@ -219,11 +219,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.2)
         cmds_html = (
             "<b>Команды</b>:\n"
-            "• <code>/help</code> — помощь\n"
-            "• <code>/more</code> — показать ещё\n"
-            "• <code>/export</code> — выгрузка результатов (XLSX/CSV)\n"
-            "• <code>/cancel</code> — отменить списание\n"
-            "• <code>/reload</code> — перезагрузка данных и пользователей (только админ)\n"
+            "• /help — помощь\n"
+            "• /more — показать ещё\n"
+            "• /export — выгрузка результатов (XLSX/CSV)\n"
+            "• /cancel — отменить списание\n"
+            "• /reload — перезагрузка данных и пользователей (только админ)\n"
         )
         await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
