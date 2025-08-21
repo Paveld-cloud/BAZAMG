@@ -71,17 +71,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{escape(SUPPORT_CONTACT)}"
     )
 
-    # Пытаемся отправить приветствие: file_id > фото > анимация > текст
+    # Пытаемся отправить приветствие: file_id > фото > умная проверка URL
     try:
         if WELCOME_MEDIA_ID:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, caption="")
         elif WELCOME_PHOTO_URL:
             await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, caption="")
         elif WELCOME_ANIMATION_URL:
-            await context.bot.send_animation(chat_id=chat_id, animation=WELCOME_ANIMATION_URL)
+            url = WELCOME_ANIMATION_URL.strip()
+            if re.search(r"\.(gif|mp4)(\?|$)", url, re.I):
+                await context.bot.send_animation(chat_id=chat_id, animation=url)
+            else:
+                await context.bot.send_photo(chat_id=chat_id, photo=url, caption="")
     except Exception as e:
         logger.warning(f"Welcome media failed: {e}")
-    await _safe_send_html_message(context.bot, chat_id, text, reply_markup=main_menu_markup())
+    await _safe_send_html_message(context.bot, chat_id, text, reply_markup=main_menu_markup())(context.bot, chat_id, text, reply_markup=main_menu_markup())
 
 # ---------- Меню ----------
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
