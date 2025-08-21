@@ -57,13 +57,21 @@ async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
         return await bot.send_message(chat_id=chat_id, text=no_tags, **kwargs)
 
 # --------------------- Пользователи: допуски -----------------
+from time import time
+_users_lock = asyncio.Lock()
+_last_users_at = 0.0
 async def ensure_users_async(force: bool = False):
-    allowed, admins, blocked = await asyncio.to_thread(data.load_users_from_sheet)
-    data.SHEET_ALLOWED.clear(); data.SHEET_ALLOWED.update(allowed)
-    data.SHEET_ADMINS.clear(); data.SHEET_ADMINS.update(admins)
-    data.SHEET_BLOCKED.clear(); data.SHEET_BLOCKED.update(blocked)
+    global _last_users_at
+    async with _users_lock:
+        if not force and (time() - _last_users_at) < data.USERS_TTL:
+            return
+        allowed, admins, blocked = await asyncio.to_thread(data.load_users_from_sheet)
+        data.SHEET_ALLOWED.clear(); data.SHEET_ALLOWED.update(allowed)
+        data.SHEET_ADMINS.clear(); data.SHEET_ADMINS.update(admins)
+        data.SHEET_BLOCKED.clear(); data.SHEET_BLOCKED.update(blocked)
+        _last_users_at = time()
 
-def ensure_users(force: bool = False):
+def ensure_users(force: bool = False):(force: bool = False):
     asyncio.create_task(ensure_users_async(force=True))
 
 def is_admin(uid: int) -> bool:
@@ -105,11 +113,11 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
 
     if WELCOME_ANIMATION_URL:
         try:
-            await context.bot.send_animation(
-                chat_id=chat_id,
-                animation=WELCOME_ANIMATION_URL,
-                caption=f"⚙️ Добро пожаловать, {first}!"
-            )
+            url = WELCOME_ANIMATION_URL.strip()
+            if re.search(r"\.(gif|mp4)(\?|$)", url, re.I):
+                await context.bot.send_animation(chat_id=chat_id, animation=url, caption=f"⚙️ Добро пожаловать, {first}!")
+            else:
+                await context.bot.send_photo(chat_id=chat_id, photo=url)
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.warning(f"Welcome animation failed: {e}")
@@ -477,39 +485,41 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return data.ASK_CONFIRM
 
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    # читаем напрямую из модулей
+    # Запись в 'История' без блокировки event loop
     from app.config import SPREADSHEET_URL
     import gspread
 
-    client = data.get_gs_client()
-    sh = client.open_by_url(SPREADSHEET_URL)
-    try:
-        ws = sh.worksheet("История")
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="История", rows=1000, cols=12)
-        ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
+    def _write():
+        client = data.get_gs_client()
+        sh = client.open_by_url(SPREADSHEET_URL)
+        try:
+            ws = sh.worksheet("История")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="История", rows=1000, cols=12)
+            ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
 
-    headers_raw = ws.row_values(1)
-    headers = [h.strip() for h in headers_raw]
-    norm = [h.lower() for h in headers]
+        headers_raw = ws.row_values(1)
+        headers = [h.strip() for h in headers_raw]
+        norm = [h.lower() for h in headers]
 
-    full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
-    display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
-    ts = data.now_local_str()
+        full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
+        display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
+        ts = data.now_local_str()
 
-    values_by_key = {
-        "дата": ts, "timestamp": ts,
-        "id": user.id, "user_id": user.id,
-        "имя": display_name, "name": display_name,
-        "тип": str(part.get("тип", "")), "type": str(part.get("тип", "")),
-        "наименование": str(part.get("наименование", "")), "name_item": str(part.get("наименование", "")),
-        "код": str(part.get("код", "")), "code": str(part.get("код", "")),
-        "数量": str(quantity), "количество": str(quantity), "qty": str(quantity),
-        "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
-    }
+        values_by_key = {
+            "дата": ts, "timestamp": ts,
+            "id": user.id, "user_id": user.id,
+            "имя": display_name, "name": display_name,
+            "тип": str(part.get("тип", "")), "type": str(part.get("тип", "")),
+            "наименование": str(part.get("наименование", "")), "name_item": str(part.get("наименование", "")),
+            "код": str(part.get("код", "")), "code": str(part.get("код", "")),
+            "数量": str(quantity), "количество": str(quantity), "qty": str(quantity),
+            "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
+        }
+        row = [values_by_key.get(hn, "") for hn in norm]
+        ws.append_row(row, value_input_option="USER_ENTERED")
 
-    row = [values_by_key.get(hn, "") for hn in norm]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    await asyncio.to_thread(_write)
     logger.info("💾 Списание записано в 'История'")
 
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
