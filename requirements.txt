@@ -1,6 +1,0 @@
-python-telegram-bot[webhooks]==20.8
-gspread==6.1.2
-google-auth==2.33.0
-pandas==2.2.2
-openpyxl==3.1.5
-aiohttp==3.9.5
