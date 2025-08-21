@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
+python-telegram-bot[webhooks]==20.8
 gspread==6.1.2
 google-auth==2.33.0
 pandas==2.2.2
