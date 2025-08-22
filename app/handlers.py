@@ -154,6 +154,45 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     # Фолбэк: просто текст, если медиа не задано или не получилось отправить
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
+# --------------------- /getfileid -----------------
+async def getfileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Включаем режим ожидания медиа ровно на следующее сообщение пользователя
+    context.user_data["awaiting_fileid"] = True
+    await update.message.reply_text("📸 Пришлите фото/анимацию/видео/документ одним сообщением — верну его file_id.")
+
+async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Реагируем только если пользователь явно включил режим через /getfileid
+    if not context.user_data.get("awaiting_fileid"):
+        return
+
+    msg = update.message
+    file_id = None
+    kind = None
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        kind = "фото"
+    elif msg.video:
+        file_id = msg.video.file_id
+        kind = "видео"
+    elif msg.animation:
+        file_id = msg.animation.file_id
+        kind = "анимация"
+    elif msg.document:
+        file_id = msg.document.file_id
+        kind = "документ"
+
+    if file_id:
+        context.user_data["awaiting_fileid"] = False
+        await msg.reply_text(
+            f"✅ Получил {kind}. Вот ваш file_id:\n\n<code>{file_id}</code>\n\n"
+            f"👉 Скопируйте значение в переменную окружения WELCOME_MEDIA_ID и перезапустите бота.",
+            parse_mode="HTML"
+        )
+    else:
+        # Оставляем режим включённым и просим прислать корректное вложение
+        await msg.reply_text("Не удалось определить file_id. Пришлите фото/анимацию/видео/документ этим же сообщением.")
+
 # --------------------- Фото карточки -----------------
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
@@ -217,6 +256,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_welcome_sequence(update, context)
     if update.message:
         await asyncio.sleep(0.2)
+        # Сделал команды кликабельными: убрал <code> вокруг /команд
         cmds_html = (
             "<b>Команды</b>:\n"
             "• /help — помощь\n"
@@ -591,6 +631,16 @@ def register_handlers(app):
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+
+    # Новый хендлер для получения file_id
+    app.add_handler(CommandHandler("getfileid", getfileid_cmd))
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL),
+            media_fileid_handler
+        ),
+        group=0
+    )
 
     # Меню приветствия
     app.add_handler(CallbackQueryHandler(menu_search_cb, pattern=r"^menu_search$"))
