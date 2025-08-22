@@ -35,7 +35,7 @@ SEARCH_FIELDS = ["тип", "наименование", "код", "oem", "изг�
 WELCOME_ANIMATION_URL = os.getenv("WELCOME_ANIMATION_URL", "").strip()
 WELCOME_PHOTO_URL = os.getenv("WELCOME_PHOTO_URL", "").strip()
 WELCOME_MEDIA_ID = os.getenv("WELCOME_MEDIA_ID", "").strip()
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @Paveidemen")
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "👨‍💻 Поддержка: @Paveldemen")
 
 # --- Админы (через ENV ADMINS="123,456")
 ADMINS = set()
