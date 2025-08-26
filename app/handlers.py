@@ -7,6 +7,7 @@ import logging
 from html import escape
 
 import pandas as pd
+import aiohttp  # ← для байтового фолбэка изображений
 from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -119,7 +120,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         f"🚀 <i>Готов к работе — просто начните вводить!</i>"
     )
 
-    # Отправляем медиа + текст одним сообщением (caption). Если не получилось — фолбэк на текст.
+    # Отправляем медиа + текст (caption). Если не получилось — фолбэк на текст.
     try:
         if WELCOME_MEDIA_ID:
             await context.bot.send_photo(
@@ -151,17 +152,15 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.warning(f"Welcome message with media failed: {e}")
 
-    # Фолбэк: просто текст, если медиа не задано или не получилось отправить
+    # Фолбэк: просто текст
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # --------------------- /getfileid -----------------
 async def getfileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Включаем режим ожидания медиа ровно на следующее сообщение пользователя
     context.user_data["awaiting_fileid"] = True
     await update.message.reply_text("📸 Пришлите фото/анимацию/видео/документ одним сообщением — верну его file_id.")
 
 async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Реагируем только если пользователь явно включил режим через /getfileid
     if not context.user_data.get("awaiting_fileid"):
         return
 
@@ -190,39 +189,70 @@ async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML"
         )
     else:
-        # Оставляем режим включённым и просим прислать корректное вложение
         await msg.reply_text("Не удалось определить file_id. Пришлите фото/анимацию/видео/документ этим же сообщением.")
 
 # --------------------- Фото карточки -----------------
+async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, reply_markup):
+    # 1) Пытаемся отправить как URL
+    try:
+        return await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"send_photo(url) failed: {e}")
+
+    # 2) Фолбэк: скачиваем байты и отправляем как файл
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                content = await resp.read()
+        bio = io.BytesIO(content)
+        bio.name = "image.jpg"
+        return await bot.send_photo(chat_id=chat_id, photo=InputFile(bio), caption=caption, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"byte fallback failed: {e}")
+        return None
+
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
     url_raw = await data.find_image_by_code_async(code)
-    if url_raw:
-        url = await data.resolve_image_url_async(url_raw)
-        if url:
-            try:
-                await update.message.reply_photo(photo=url, caption=text, reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"URL фото не сработал ({url}): {e}")
-    await update.message.reply_text(text, reply_markup=kb)
+    if not url_raw:
+        logger.info(f"[image] нет записи в индексе для кода: {code}")
+        return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
+
+    url = await data.resolve_image_url_async(url_raw)
+    if not url:
+        logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
+        return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
+
+    sent = await _send_photo_with_fallback(update.get_bot(), update.effective_chat.id, url, text, kb)
+    if sent:
+        return
+    logger.warning(f"[image] не удалось отправить фото для кода {code} (url={url})")
+    await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
 
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
 
     url_raw = await data.find_image_by_code_async(code)
-    if url_raw:
-        url = await data.resolve_image_url_async(url_raw)
-        if url:
-            try:
-                await bot.send_photo(chat_id=chat_id, photo=url, caption=text, reply_markup=kb)
-                return
-            except Exception as e:
-                logger.warning(f"URL фото не сработал ({url}): {e}")
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    if not url_raw:
+        logger.info(f"[image] нет записи в индексе для кода: {code}")
+        return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
+
+    url = await data.resolve_image_url_async(url_raw)
+    if not url:
+        logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
+        return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
+
+    sent = await _send_photo_with_fallback(bot, chat_id, url, text, kb)
+    if sent:
+        return
+    logger.warning(f"[image] не удалось отправить фото (bot) для кода {code} (url={url})")
+    await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
 
 # --------------------- Меню (callbacks) -----------------
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -256,7 +286,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_welcome_sequence(update, context)
     if update.message:
         await asyncio.sleep(0.2)
-        # Сделал команды кликабельными: убрал <code> вокруг /команд
         cmds_html = (
             "<b>Команды</b>:\n"
             "• /help — помощь\n"
@@ -401,7 +430,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             field_mask = pd.Series(True, index=df_.index)
             for t in tokens:
                 if t:
-                    field_mask &= series.str.contains(re.escape(t), na=False)
+                    field_mask &= series.str_contains(re.escape(t), na=False) if hasattr(series, "str_contains") else series.str.contains(re.escape(t), na=False)
             mask_any |= field_mask
         matched_indices = set(df_.index[mask_any])
 
