@@ -439,4 +439,44 @@ import asyncio
 async def asyncio_to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+# -------------------- Backward-compat для main.py --------------------
+def initial_load():
+    """
+    Совместимость со старым main.py: прогреваем данные и загружаем пользователей.
+    """
+    try:
+        ensure_fresh_data(force=True)
+    except Exception as e:
+        logger.exception(f"initial_load: ошибка при ensure_fresh_data: {e}")
+        raise
+
+    # Пытаемся сразу подтянуть пользователей (если есть лист)
+    try:
+        allowed, admins, blocked = load_users_from_sheet()
+        SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
+        SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
+        SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
+        logger.info(f"Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    except Exception as e:
+        logger.warning(f"initial_load: не удалось загрузить пользователей: {e}")
+
+
+async def initial_load_async():
+    """
+    Асинхронная версия на всякий: если когда-нибудь понадобится.
+    """
+    try:
+        await ensure_fresh_data_async(force=True)
+    except Exception as e:
+        logger.exception(f"initial_load_async: ошибка при ensure_fresh_data_async: {e}")
+        raise
+
+    try:
+        allowed, admins, blocked = await asyncio_to_thread(load_users_from_sheet)
+        SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
+        SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
+        SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
+        logger.info(f"(async) Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
+    except Exception as e:
+        logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
 
