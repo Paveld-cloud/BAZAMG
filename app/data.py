@@ -1,89 +1,87 @@
 import os
-import re
 import io
-import json
+import re
 import time
-import math
-import asyncio
-from datetime import datetime
-from typing import Optional, Dict, Any, Set, List, DefaultDict
-from collections import defaultdict
-from zoneinfo import ZoneInfo
-from telegram.ext import ConversationHandler
+import json
+import logging
+from typing import Dict, Set, Tuple, List, Optional
 
-ASK_QUANTITY, ASK_COMMENT, CONFIRM = range(3)
-
+import pandas as pd
 import aiohttp
 import gspread
-import pandas as pd
-from pandas import DataFrame
 from google.oauth2.service_account import Credentials
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# ========================= НАСТРОЙКИ / ENV =========================
+logger = logging.getLogger("bot.data")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "")
-SHEET_NAME = (os.getenv("SHEET_NAME", "").strip() or "").strip()
-CREDS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+# ---------- Конфиг ----------
+try:
+    from app.config import (
+        SPREADSHEET_URL,
+        SAP_SHEET_NAME,          # "SAP"
+        USERS_SHEET_NAME,        # "Пользователи" (опц.)
+        DATA_TTL,                # сек, например 600
+        SEARCH_COLUMNS,          # ["тип","наименование","код","oem","изготовитель"]
+    )
+except Exception:
+    SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "")
+    SAP_SHEET_NAME = os.getenv("SAP_SHEET_NAME", "SAP")
+    USERS_SHEET_NAME = os.getenv("USERS_SHEET_NAME", "Пользователи")
+    DATA_TTL = int(os.getenv("DATA_TTL", "600"))
+    SEARCH_COLUMNS = ["тип","наименование","код","oem","изготовитель","парт номер","oem парт номер"]
 
-TZ_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")
-DATA_TTL = int(os.getenv("DATA_TTL", "300"))       # кеш данных (сек)
-USERS_TTL = int(os.getenv("USERS_TTL", "300"))     # кеш пользователей (сек)
-
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# ---- Поля для поиска (ENV + дефолт) ----
-DEFAULT_SEARCH_COLUMNS = [
-    "тип", "наименование", "код", "oem", "изготовитель",
-    "парт номер", "oem парт номер",
-]
+# ---------- Глобальное состояние ----------
+df: Optional[pd.DataFrame] = None
+_last_load_ts: float = 0.0
 
-_env = os.getenv("SEARCH_COLUMNS", "").strip()
-try:
-    from_env = json.loads(_env) if _env else []
-    if not isinstance(from_env, list):
-        from_env = []
-except Exception:
-    from_env = []
+_search_index: Dict[str, Set[int]] = {}
+_image_index: Dict[str, str] = {}
 
-# Итог: порядок из ENV сохраняем, но гарантированно добавляем дефолтные поля; дубликаты убираем; всё в lower()
-SEARCH_COLUMNS: List[str] = list(
-    dict.fromkeys(
-        [
-            (c.strip().lower() if isinstance(c, str) else "")
-            for c in (from_env + DEFAULT_SEARCH_COLUMNS)
-            if c
-        ]
-    )
-)
+# Состояние пользователей (используется в handlers)
+user_state: Dict[int, dict] = {}
+issue_state: Dict[int, dict] = {}
 
-# ========================= ГЛОБАЛЬНЫЕ СОСТОЯНИЯ =========================
-
-df: Optional[DataFrame] = None
-_last_load_ts = 0.0
-_search_index: Optional[Dict[str, Set[int]]] = None
-_image_index: Optional[Dict[str, str]] = None
-
+# Списки пользователей
 SHEET_ALLOWED: Set[int] = set()
 SHEET_ADMINS: Set[int] = set()
 SHEET_BLOCKED: Set[int] = set()
-_last_users_ts = 0.0
 
-# ========================= УТИЛИТЫ =========================
+# Шаги диалога
+ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
-def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+# ---------- Утилиты ----------
+def _norm_code(x: str) -> str:
+    return re.sub(r"[\s\-]+", "", str(x or "").strip().lower())
+
+def _norm_str(x: str) -> str:
+    return str(x or "").strip().lower()
+
+def now_local_str(tz_name: str = "Asia/Tashkent") -> str:
+    tz = ZoneInfo(tz_name)
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+def val(d: dict, key: str, default: str = "") -> str:
+    return str(d.get(key, default) or default)
+
+def _url_name_tokens(url: str) -> List[str]:
     try:
-        return datetime.now(ZoneInfo(TZ_NAME)).strftime(fmt)
+        path = re.sub(r"[?#].*$", "", str(url or ""))
+        name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        return re.findall(r"[a-z0-9]+", name)
     except Exception:
-        return datetime.utcnow().strftime(fmt)
+        return []
 
-def val(row: dict, key: str, default: str = "—") -> str:
-    v = row.get(key)
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return default
-    s = str(v).strip()
-    return s if s else default
+def squash(text: str) -> str:
+    return re.sub(r"[\W_]+", "", str(text or "").lower())
 
+def normalize(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
+
+# ---------- Формат карточки ----------
 def format_row(row: dict) -> str:
     return (
         f"🔹 Тип: {val(row, 'тип')}\n"
@@ -97,361 +95,184 @@ def format_row(row: dict) -> str:
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
-def normalize(text: str) -> str:
-    return re.sub(r"[^\w\s]", " ", (text or "")).lower().strip()
-
-def squash(text: str) -> str:
-    return re.sub(r"[\W_]+", "", (text or "").lower(), flags=re.UNICODE)
-
-# ========================= GOOGLE SHEETS =========================
-
-def _get_gs_client():
-    if not CREDS_JSON.strip():
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON is empty or not set.")
-    creds_info = json.loads(CREDS_JSON)
-    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+# ---------- Google Sheets ----------
+def get_gs_client():
+    if not GOOGLE_APPLICATION_CREDENTIALS_JSON:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON не задан")
+    try:
+        info = json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    except json.JSONDecodeError:
+        creds = Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIALS_JSON, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def _open_data_worksheet(client):
+def _load_sap_dataframe() -> pd.DataFrame:
+    client = get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
-    if SHEET_NAME:
-        try:
-            return sh.worksheet(SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            pass
-    return sh.sheet1
+    ws = sh.worksheet(SAP_SHEET_NAME)
+    records = ws.get_all_records()
+    new_df = pd.DataFrame(records)
+    new_df.columns = [c.strip().lower() for c in new_df.columns]
+    for col in ("код", "oem", "парт номер", "oem парт номер"):
+        if col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+    if "image" in new_df.columns:
+        new_df["image"] = new_df["image"].astype(str).str.strip()
+    return new_df
 
-def load_data_blocking() -> List[dict]:
-    client = _get_gs_client()
-    ws = _open_data_worksheet(client)
-    return ws.get_all_records()
+# ---------- Индексы ----------
+def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
+    idx: Dict[str, Set[int]] = {}
+    cols = [c for c in SEARCH_COLUMNS if c in df_.columns]
+    for i, row in df_.iterrows():
+        for c in cols:
+            tokenized = re.findall(r"[a-zA-Zа-яА-Я0-9]+", str(row.get(c, "")), flags=re.IGNORECASE)
+            for t in tokenized:
+                key = _norm_str(t)
+                if not key:
+                    continue
+                idx.setdefault(key, set()).add(i)
+    return idx
 
-def _truthy(x) -> bool:
-    s = str(x).strip().lower()
-    return s in {"1","true","yes","y","да","истина","ok","ок","allowed","разрешен","разрешено"} or (s.isdigit() and int(s) > 0)
-
-def _to_int_or_none(x):
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return None
-        s = str(x).strip()
-        if not s:
-            return None
-        m = re.search(r"-?\d+", s)
-        return int(m.group(0)) if m else None
-    except Exception:
-        return None
-
-def load_users_from_sheet():
-    client = _get_gs_client()
-    sh = client.open_by_url(SPREADSHEET_URL)
-    try:
-        ws = sh.worksheet("Пользователи")
-    except gspread.WorksheetNotFound:
-        try:
-            ws = sh.worksheet("Users")
-        except gspread.WorksheetNotFound:
-            return set(), set(), set()
-
-    headers_raw = ws.row_values(1) or []
-    if not headers_raw:
-        return set(), set(), set()
-
-    norm_headers: List[str] = []
-    seen: Set[str] = set()
-    for i, h in enumerate(headers_raw, start=1):
-        name = (h or "").strip() or f"col_{i}"
-        lname = re.sub(r"\s+", " ", name.lower()).strip()
-        base = lname
-        k = 1
-        while lname in seen:
-            k += 1
-            lname = f"{base}_{k}"
-        seen.add(lname)
-        norm_headers.append(lname)
-
-    try:
-        rows = ws.get_all_records(expected_headers=norm_headers)
-    except Exception:
-        values = ws.get_all_values()
-        data_rows = values[1:] if len(values) > 1 else []
-        rows = []
-        for r in data_rows:
-            padded = (r + [""] * (len(norm_headers) - len(r)))[:len(norm_headers)]
-            rows.append({norm_headers[i]: padded[i] for i in range(len(norm_headers))})
-
-    if not rows:
-        return set(), set(), set()
-
-    allowed, admins, blocked = set(), set(), set()
-    for row in rows:
-        r = {str(k).strip().lower(): v for k, v in row.items()}
-
-        uid = (
-            _to_int_or_none(r.get("user_id"))
-            or _to_int_or_none(r.get("userid"))
-            or _to_int_or_none(r.get("id"))
-            or _to_int_or_none(r.get("uid"))
-            or _to_int_or_none(r.get("телеграм id"))
-            or _to_int_or_none(r.get("пользователь"))
-            or _to_int_or_none(r.get("user"))
-        )
-        if not uid:
-            continue
-
-        role = str(r.get("role") or r.get("роль") or "").strip().lower()
-        is_admin = role in {"admin","админ","administrator","администратор"} or _truthy(r.get("admin"))
-        is_blocked = _truthy(r.get("blocked") or r.get("ban") or r.get("запрет"))
-        is_allowed = _truthy(r.get("allowed") or r.get("доступ") or (not role or role == "user"))
-
-        if is_blocked:
-            blocked.add(uid)
-        if is_admin:
-            admins.add(uid)
-            is_allowed = True
-        if is_allowed and not is_blocked:
-            allowed.add(uid)
-
-    return allowed, admins, blocked
-
-def save_issue_to_sheet_blocking(user, part: Dict[str, Any], quantity, comment: str):
-    client = _get_gs_client()
-    sh = client.open_by_url(SPREADSHEET_URL)
-    try:
-        ws = sh.worksheet("История")
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="История", rows=1000, cols=12)
-        ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
-
-    headers_raw = ws.row_values(1)
-    headers = [h.strip() for h in headers_raw]
-    norm = [h.lower() for h in headers]
-
-    full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
-    display_name = full_name or (f"@{user.username}" if getattr(user, 'username', None) else str(user.id))
-    ts = now_local_str()
-
-    values_by_key = {
-        "дата": ts, "timestamp": ts,
-        "id": user.id, "user_id": user.id,
-        "имя": display_name, "name": display_name,
-        "тип": str(part.get("тип", "")), "type": str(part.get("тип", "")),
-        "наименование": str(part.get("наименование", "")), "name_item": str(part.get("наименование", "")),
-        "код": str(part.get("код", "")), "code": str(part.get("код", "")),
-        "количество": str(quantity), "qty": str(quantity),
-        "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
-    }
-
-    # Подгоняем под текущие заголовки листа
-    row = [values_by_key.get(hn, "") for hn in norm]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-# ========================= ИНДЕКСАЦИЯ / ПОИСК =========================
-
-def build_search_index(df: DataFrame) -> Dict[str, Set[int]]:
-    """
-    Индексируем по колонкам из SEARCH_COLUMNS.
-    Токены — \w+, всё в lower().
-    """
-    index: DefaultDict[str, Set[int]] = defaultdict(set)
-    for col in SEARCH_COLUMNS:
-        if col not in df.columns:
-            continue
-        # Series.items() для pandas 2.x
-        for idx, val in df[col].astype(str).str.lower().items():
-            for t in re.findall(r"\w+", val):
-                if t:
-                    index[t].add(idx)
-    return dict(index)
-
-def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> int:
-    score = 0
-    for f in SEARCH_COLUMNS:
-        valx = str(row.get(f, "")).lower()
-        if not valx:
-            continue
-        words = set(re.findall(r"\w+", valx))
-        tok_hit = sum(1 for t in tokens if t in words)
-        sub_hit = sum(1 for t in tokens if t and t in valx)
-        sq = re.sub(r"[\W_]+", "", valx)
-        squash_hit = 1 if q_squash and q_squash in sq else 0
-        weight = 2 if f in ("код", "oem", "парт номер", "oem парт номер") else 1
-        score += weight * (2 * tok_hit + sub_hit) + 3 * squash_hit * weight
-    return score
-
-def match_row_by_index(tokens: List[str]) -> Set[int]:
-    if not _search_index:
-        return set()
-    result = None
-    for t in tokens:
-        indices = _search_index.get(t, set())
-        if result is None:
-            result = indices.copy()
-        else:
-            result &= indices
-        if not result:
-            break
-    return result or set()
-
-# ========================= КАРТИНКИ / ИНДЕКС ИМЁН ФАЙЛОВ =========================
-
-def _filename_from_url(u: str) -> str:
-    from urllib.parse import urlparse, parse_qs, unquote
-    u = (u or "").strip()
-    if not u:
-        return ""
-    p = urlparse(u)
-    name = unquote(p.path.rsplit("/", 1)[-1] or "")
-    if not name or "." not in name:
-        qnames = []
-        for v in parse_qs(p.query).values():
-            qnames.extend(v)
-        candidates = qnames + [p.fragment]
-        for cand in candidates:
-            if isinstance(cand, str):
-                cand = unquote(cand)
-                cand_name = cand.rsplit("/", 1)[-1]
-                if "." in cand_name:
-                    name = cand_name
-                    break
-    return name
-
-def _tokens_from_filename(u: str) -> List[str]:
-    name = _filename_from_url(u)
-    if not name:
-        return []
-    base = name.rsplit(".", 1)[0]
-    fused = re.sub(r"[\W_]+", "", base.lower(), flags=re.UNICODE)
-    parts = re.split(r"[\W_]+", base.lower())
-    parts = [p for p in parts if p]
-    seen, out = set(), []
-    for t in [fused] + parts:
-        if t and t not in seen:
-            seen.add(t); out.append(t)
-    return out
-
-def build_image_index(df: DataFrame) -> Dict[str, str]:
-    if "image" not in df.columns:
-        return {}
+def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
     index: Dict[str, str] = {}
-    for _, row in df.iterrows():
+    if "image" not in df_.columns:
+        return index
+    skip = {"png", "jpg", "jpeg", "gif", "webp", "svg"}
+    for _, row in df_.iterrows():
         url = str(row.get("image", "")).strip()
         if not url:
             continue
-        tokens = _tokens_from_filename(url)
+        tokens = _url_name_tokens(url)
+        if not tokens:
+            continue
         for t in tokens:
+            if t in skip or len(t) < 4:
+                continue
             index.setdefault(t, url)
-
-        # усилим по кодам, если код встречается в имени файла
-        for col in ("код", "oem", "парт номер", "oem парт номер"):
-            code_val = str(row.get(col, "")).strip().lower()
-            if code_val and tokens:
-                fused = tokens[0]
-                raw = code_val
-                sq = re.sub(r"[\W_]+", "", code_val)
-                if raw and raw in fused:
-                    index.setdefault(raw, url)
-                if sq and sq in fused:
-                    index.setdefault(sq, url)
+        name_join = "".join(tokens)
+        index.setdefault(name_join, url)
     return index
 
-async def find_image_by_code_async(code: str) -> str:
-    if not code or not _image_index:
-        return ""
-    raw = (code or "").strip().lower()
-    sq = re.sub(r"[\W_]+", "", raw)
-    # прямой
-    hit = _image_index.get(raw) or _image_index.get(sq)
-    if hit:
-        return hit
-    # подстроки
-    for k, url in _image_index.items():
-        if (sq and sq in k) or (raw and raw in k):
-            return url
-    # ничего не нашли
-    return ""
-
-# ---------- ЗАГРУЗКА / КЕШИ ----------
-
-def initial_load():
-    global df, _last_load_ts, _search_index, _image_index
-    data = load_data_blocking()
-    new_df = DataFrame(data)
-    new_df.columns = new_df.columns.str.strip().str.lower()
-
-    # нормализуем ключевые колонки
-    for col in ("код", "oem", "парт номер", "oem парт номер"):
-        if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
-    if "image" in new_df.columns:
-        new_df["image"] = new_df["image"].astype(str).str.strip()
-
-    df = new_df
-    _search_index = build_search_index(df)
-    _image_index = build_image_index(df)
-    _last_load_ts = time.time()
-
-    allowed, admins, blocked = load_users_from_sheet()
-    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
-    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
-    _last_users_ts = time.time()
-
-async def ensure_fresh_data_async(force: bool = False):
-    global df, _last_load_ts, _search_index, _image_index
-    if not force and df is not None and (time.time() - _last_load_ts <= DATA_TTL):
-        return
-    data = await asyncio.to_thread(load_data_blocking)
-    new_df = DataFrame(data)
-    new_df.columns = new_df.columns.str.strip().str.lower()
-    for col in ("код", "oem", "парт номер", "oem парт номер"):
-        if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
-    if "image" in new_df.columns:
-        new_df["image"] = new_df["image"].astype(str).str.strip()
-
-    df = new_df
-    _search_index = build_search_index(df)
-    _image_index = build_image_index(df)
-    _last_load_ts = time.time()
-
 def ensure_fresh_data(force: bool = False):
-    # Планово запускаем обновление в фоне
-    asyncio.create_task(ensure_fresh_data_async(force=force))
-
-async def ensure_users_async(force: bool = False):
-    global SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED, _last_users_ts
-    if not force and (time.time() - _last_users_ts <= USERS_TTL):
+    global df, _search_index, _image_index, _last_load_ts
+    need = force or df is None or (time.time() - _last_load_ts > DATA_TTL)
+    if not need:
         return
-    allowed, admins, blocked = await asyncio.to_thread(load_users_from_sheet)
-    SHEET_ALLOWED, SHEET_ADMINS, SHEET_BLOCKED = allowed, admins, blocked
-    _last_users_ts = time.time()
+    new_df = _load_sap_dataframe()
+    df = new_df
+    _search_index = build_search_index(df)
+    _image_index = build_image_index(df)
+    _last_load_ts = time.time()
+    logger.info(f"✅ Перезагружено {len(df)} строк и построены индексы")
 
-def ensure_users(force: bool = False):
-    asyncio.create_task(ensure_users_async(force=force))
+# ---------- Поиск ----------
+def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> float:
+    tkns = [_norm_str(t) for t in tokens if t]
+    if not tkns:
+        return 0.0
+    code = _norm_str(row.get("код", ""))
+    name = _norm_str(row.get("наименование", ""))
+    weights = {"код": 5.0, "наименование": 3.0}
+    fields = {"код": code, "наименование": name}
+    score = 0.0
+    for f, text in fields.items():
+        for t in tkns:
+            if t and (t in text):
+                score += weights[f]
+    if q_squash:
+        joined = squash(code + name)
+        if q_squash in joined:
+            score += 10.0
+    if code and any(code.startswith(t) for t in tkns):
+        score += 20.0
+    return score
 
-# ---------- ДОСТУПЫ ----------
+def match_row_by_index(tokens: List[str]) -> List[int]:
+    """
+    Возвращает индексы строк, отсортированные по релевантности.
+    Сначала пересечение, потом fallback — объединение.
+    """
+    ensure_fresh_data()
+    if not tokens:
+        return []
+    tokens_norm = [_norm_str(t) for t in tokens if t]
+    if not tokens_norm:
+        return []
+    # строгий поиск
+    sets: List[Set[int]] = []
+    for t in tokens_norm:
+        s = _search_index.get(t, set())
+        if not s:
+            sets = []
+            break
+        sets.append(s)
+    if sets:
+        acc = sets[0].copy()
+        for s in sets[1:]:
+            acc &= s
+            if not acc:
+                break
+        found = acc
+    else:
+        # мягкий поиск
+        found = set()
+        for t in tokens_norm:
+            found |= _search_index.get(t, set())
+    if not found:
+        return []
+    q_squash = squash(" ".join(tokens_norm))
+    scored = [(idx, _relevance_score(df.iloc[idx].to_dict(), tokens_norm, q_squash)) for idx in found]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [idx for idx, _ in scored]
 
-def is_admin(uid: int) -> bool:
-    ensure_users()
-    return uid in SHEET_ADMINS
+# ---------- Экспорт ----------
+def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df_.to_excel(writer, index=False)
+    buf.seek(0)
+    return buf
 
-def is_allowed(uid: int) -> bool:
-    ensure_users()
-    if uid in SHEET_BLOCKED:
-        return False
-    if SHEET_ALLOWED:
-        # ВАЖНО: правильное имя множества админов (без кириллической 'М')
-        return (uid in SHEET_ALLOWED) or (uid in SHEET_ADMINS)
-    return True
+# ---------- Пользователи ----------
+def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
+    allowed: Set[int] = set()
+    admins: Set[int] = set()
+    blocked: Set[int] = set()
+    try:
+        client = get_gs_client()
+        sh = client.open_by_url(SPREADSHEET_URL)
+        ws = sh.worksheet(USERS_SHEET_NAME)
+    except Exception:
+        logger.info("Лист пользователей отсутствует")
+        return allowed, admins, blocked
+    all_vals = ws.get_all_values()
+    if not all_vals:
+        return allowed, admins, blocked
+    headers = [h.strip().lower() for h in all_vals[0]]
+    rows = all_vals[1:]
+    for r in rows:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        uid = row.get("user_id") or row.get("id") or row.get("uid")
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+        role = str(row.get("role") or "").strip().lower()
+        if role in ("admin", "админ"):
+            admins.add(uid); allowed.add(uid)
+        elif role in ("blocked", "ban"):
+            blocked.add(uid)
+        else:
+            allowed.add(uid)
+    return allowed, admins, blocked
 
-def get_admin_ids() -> Set[int]:
-    return set(SHEET_ADMINS)
-
-# ---------- АДАПТЕРЫ ДЛЯ ХЕНДЛЕРОВ ----------
-
-def get_df() -> Optional[DataFrame]:
-    return df
-
-def get_image_index_copy() -> Dict[str, str]:
-    return dict(_image_index or {})
+# ---------- Инициализация ----------
+def initial_load():
+    ensure_fresh_data(force=True)
+    allowed, admins, blocked = load_users_from_sheet()
+    SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
+    SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
+    SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
+    logger.info(f"Users: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
 
