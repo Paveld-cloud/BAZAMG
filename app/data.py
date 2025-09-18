@@ -22,7 +22,7 @@ try:
         SAP_SHEET_NAME,          # "SAP"
         USERS_SHEET_NAME,        # "Пользователи" (опц.)
         DATA_TTL,                # сек, например 600
-        SEARCH_COLUMNS,          # ["тип","наименование","код","oem","изготовитель", ...]
+        SEARCH_COLUMNS,          # ["тип","наименование","код","oem","изготовитель"]
     )
 except Exception:
     SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "")
@@ -91,18 +91,9 @@ def _url_name_tokens(url: str) -> List[str]:
         return []
 
 def _safe_col(df_: pd.DataFrame, col: str) -> Optional[pd.Series]:
-    """Возвращает Series(stripped+lower) или None, если колонки нет."""
     if col not in df_.columns:
         return None
     return df_[col].astype(str).fillna("").str.strip().str.lower()
-
-def squash(text: str) -> str:
-    """Убираем все небуквенно-цифровые символы, lower."""
-    return re.sub(r"[\W_]+", "", str(text or "").lower())
-
-def normalize(text: str) -> str:
-    """Нормализатор пользовательского запроса (для токенизации)."""
-    return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
 
 # ---------- Формат карточки ----------
 def format_row(row: dict) -> str:
@@ -139,7 +130,7 @@ def _load_sap_dataframe() -> pd.DataFrame:
 
     new_df.columns = [c.strip().lower() for c in new_df.columns]
 
-    for col in ("код", "oem", "парт номер", "oem парт номер"):
+    for col in ("код", "oem"):
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).str.strip().str.lower()
     if "image" in new_df.columns:
@@ -167,8 +158,9 @@ def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
 def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
     """
     СТРОГО ПО ТРЕБОВАНИЮ:
-    - Индекс по ВСЕМ URL из 'image': ключи = информативные токены из имени файла + их склейка.
-    - Дальше поиск идёт по этому индексу, а не по текстовым колонкам.
+    - Строим индекс по ВСЕМ URL из колонки 'image'.
+    - Ключами служат 'кодовые' токены из имени файла (и их склейка).
+    - В дальнейшем запрос 'код' ищет по этому индексу.
     """
     index: Dict[str, str] = {}
     if "image" not in df_.columns:
@@ -176,6 +168,7 @@ def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
         return index
 
     skip = {"png", "jpg", "jpeg", "gif", "webp", "svg"}
+    added_tokens = 0
 
     for _, row in df_.iterrows():
         url = str(row.get("image", "")).strip()
@@ -190,15 +183,19 @@ def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
         for t in tokens:
             if t in skip:
                 continue
+            # отсекаем совсем короткие куски, чтобы не ловить мусор
             if len(t) < 4:
                 continue
-            index.setdefault(t, url)
+            if t not in index:
+                index[t] = url
+                added_tokens += 1
 
         # Также индексируем «склейку» токенов (на случай если код вшит без разделителей)
         name_join = "".join(tokens)  # например: 'uz005399png'
-        index.setdefault(name_join, url)
+        if name_join not in index:
+            index[name_join] = url
 
-    logger.info(f"image-index: unique_keys={len(index)}")
+    logger.info(f"image-index: tokens={added_tokens}, unique_keys={len(index)}")
     return index
 
 def ensure_fresh_data(force: bool = False):
@@ -213,6 +210,9 @@ def ensure_fresh_data(force: bool = False):
     _last_load_ts = time.time()
     logger.info(f"✅ Перезагружено {len(df)} строк и построены индексы")
 
+async def ensure_fresh_data_async(force: bool = False):
+    await asyncio_to_thread(ensure_fresh_data, force)
+
 # ---------- Картинки ----------
 async def find_image_by_code_async(code: str) -> str:
     """
@@ -225,11 +225,15 @@ async def find_image_by_code_async(code: str) -> str:
     key = _norm_code(code)
 
     # A) поиск по индексу точного ключа
-    hit = _image_index.get(key)
-    if hit:
-        return hit
+    if key in _image_index:
+        return _image_index[key]
 
-    # B) фолбэк — прямой обход столбца image, ищем в ИМЕНИ ФАЙЛА (tokens + склейка)
+    # B) поиск по «склейке» (если индекс создавал ключи-склейки)
+    # (обычно это не требуется, т.к. 'key' уже склеенный, но попробуем)
+    if key in _image_index:
+        return _image_index[key]
+
+    # C) фолбэк — прямой обход столбца image, ищем в ИМЕНИ ФАЙЛА
     try:
         if df is not None and "image" in df.columns:
             for url in df["image"]:
@@ -287,6 +291,39 @@ async def resolve_image_url_async(url_raw: str) -> str:
     return url
 
 # ---------- Поиск ----------
+def match_row_by_index(tokens: List[str]) -> Set[int]:
+    """
+    Возвращает индексы строк, в которых встречаются ВСЕ токены.
+    """
+    ensure_fresh_data()
+    if not tokens:
+        return set()
+    tokens_norm = [_norm_str(t) for t in tokens if t]
+    if not tokens_norm:
+        return set()
+
+    sets: List[Set[int]] = []
+    for t in tokens_norm:
+        s = _search_index.get(t, set())
+        if not s:
+            return set()
+        sets.append(s)
+
+    acc = sets[0].copy()
+    for s in sets[1:]:
+        acc &= s
+        if not acc:
+            break
+    return acc
+
+def squash(text: str) -> str:
+    """Убираем все небуквенно-цифровые символы, lower."""
+    return re.sub(r"[\W_]+", "", str(text or "").lower())
+
+def normalize(text: str) -> str:
+    """Нормализатор пользовательского запроса (для токенизации)."""
+    return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
+
 def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> float:
     """
     Простой скоринг: веса по полям + бусты за совпадение кода/начало кода/склейку.
@@ -328,44 +365,6 @@ def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> float:
                 score += 5.0
 
     return score
-
-def match_row_by_index(tokens: List[str]) -> Set[int]:
-    """
-    Возвращает индексы строк, в которых встречаются токены.
-    1) Строгий режим: пересечение всех токенов.
-    2) Если пусто — мягкий режим: объединение.
-    (Сортировка по релевантности делается снаружи через _relevance_score — как у тебя в handlers)
-    """
-    ensure_fresh_data()
-    if not tokens:
-        return set()
-    tokens_norm = [_norm_str(t) for t in tokens if t]
-    if not tokens_norm:
-        return set()
-
-    # --- строгий поиск (пересечение)
-    sets: List[Set[int]] = []
-    for t in tokens_norm:
-        s = _search_index.get(t, set())
-        if not s:
-            sets = []  # сорвалось пересечение
-            break
-        sets.append(s)
-
-    if sets:
-        acc = sets[0].copy()
-        for s in sets[1:]:
-            acc &= s
-            if not acc:
-                break
-        found = acc
-    else:
-        # --- мягкий поиск (объединение)
-        found = set()
-        for t in tokens_norm:
-            found |= _search_index.get(t, set())
-
-    return found
 
 # ---------- Экспорт ----------
 def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
@@ -446,7 +445,7 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
 
     def truthy(v) -> bool:
         s = str(v).strip().lower()
-        return s in ("1", "true", "да", "y", "yes", "ok", "ок")
+        return s in ("1", "true", "да", "y", "yes")
 
     for _, r in dfu.iterrows():
         uid = _parse_int(r.get("user_id") or r.get("uid") or r.get("id"))
@@ -455,9 +454,9 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
 
         if has_role:
             role = str(r.get("role", "")).strip().lower()
-            if role in ("admin", "админ", "administrator", "администратор"):
+            if role in ("admin", "админ"):
                 admins.add(uid); allowed.add(uid)
-            elif role in ("blocked", "ban", "banned", "заблокирован", "запрет"):
+            elif role in ("blocked", "ban", "заблокирован"):
                 blocked.add(uid)
             else:
                 allowed.add(uid)
@@ -506,7 +505,7 @@ async def initial_load_async():
     Асинхронная версия.
     """
     try:
-        await asyncio_to_thread(ensure_fresh_data, True)
+        await ensure_fresh_data_async(force=True)
     except Exception as e:
         logger.exception(f"initial_load_async: ensure_fresh_data_async error: {e}")
         raise
@@ -518,5 +517,3 @@ async def initial_load_async():
         logger.info(f"(async) Пользователи прочитаны: allowed={len(allowed)}, admins={len(admins)}, blocked={len(blocked)}")
     except Exception as e:
         logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
-
-
