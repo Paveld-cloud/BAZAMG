@@ -1,0 +1,10 @@
+# requirements.txt
+python-telegram-bot[webhooks]==20.7
+aiohttp==3.9.5
+
+gspread==6.1.2
+google-auth==2.32.0
+
+pandas==2.2.2
+openpyxl==3.1.5
+tzdata==2024.1
