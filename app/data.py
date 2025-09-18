@@ -9,6 +9,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Set, List, DefaultDict
 from collections import defaultdict
 from zoneinfo import ZoneInfo
+from telegram.ext import ConversationHandler
+
+ASK_QUANTITY, ASK_COMMENT, CONFIRM = range(3)
+
 
 import aiohttp
 import gspread
