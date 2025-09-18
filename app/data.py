@@ -98,22 +98,14 @@ def _safe_col(df_: pd.DataFrame, col: str) -> Optional[pd.Series]:
 # ---------- Формат карточки ----------
 def format_row(row: dict) -> str:
     return (
-        f"🔹 Тип: {val(row, 'тип')}
-"
-        f"📦 Наименование: {val(row, 'наименование')}
-"
-        f"🔢 Код: {val(row, 'код')}
-"
-        f"🔢 Парт Номер: {val(row, 'парт номер')}
-"
-        f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}
-"
-        f"📦 Кол-во: {val(row, 'количество')}
-"
-        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}
-"
-        f"🏭 Изготовитель: {val(row, 'изготовитель')}
-"
+        f"🔹 Тип: {val(row, 'тип')}\n"
+        f"📦 Наименование: {val(row, 'наименование')}\n"
+        f"🔢 Код: {val(row, 'код')}\n"
+        f"🔢 Парт Номер: {val(row, 'парт номер')}\n"
+        f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}\n"
+        f"📦 Кол-во: {val(row, 'количество')}\n"
+        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}\n"
+        f"🏭 Изготовитель: {val(row, 'изготовитель')}\n"
         f"⚙️ OEM: {val(row, 'oem')}"
     )
 
