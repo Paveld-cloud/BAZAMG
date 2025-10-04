@@ -22,40 +22,36 @@ try:
         SPREADSHEET_URL,
         SAP_SHEET_NAME,          # "SAP"
         USERS_SHEET_NAME,        # "Пользователи"
+        HISTORY_SHEET_NAME,      # "История"
         DATA_TTL,
         SEARCH_COLUMNS,
-        # опционально может быть в config.py; если нет — ниже дефолт
-        HISTORY_SHEET_NAME as _HIST_IN_CONFIG,
+        TZ_NAME,
     )
-    HISTORY_SHEET_NAME = _HIST_IN_CONFIG
 except Exception:
-    SPREADSHEET_URL   = os.getenv("SPREADSHEET_URL", "")
-    SAP_SHEET_NAME    = os.getenv("SAP_SHEET_NAME", "SAP")
-    USERS_SHEET_NAME  = os.getenv("USERS_SHEET_NAME", "Пользователи")
-    HISTORY_SHEET_NAME= os.getenv("HISTORY_SHEET_NAME", "История")
-    DATA_TTL          = int(os.getenv("DATA_TTL", "600"))
-    SEARCH_COLUMNS    = ["тип","наименование","код","oem","изготовитель","парт номер","oem парт номер"]
+    SPREADSHEET_URL    = os.getenv("SPREADSHEET_URL", "")
+    SAP_SHEET_NAME     = os.getenv("SAP_SHEET_NAME", "SAP")
+    USERS_SHEET_NAME   = os.getenv("USERS_SHEET_NAME", "Пользователи")
+    HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "История")
+    DATA_TTL           = int(os.getenv("DATA_TTL", "600"))
+    TZ_NAME            = os.getenv("TIMEZONE", "Asia/Tashkent")
+    SEARCH_COLUMNS     = ["тип","наименование","код","oem","изготовитель","парт номер","oem парт номер"]
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TZ_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")
 
 # ---------- Глобальное состояние ----------
 df: Optional[pd.DataFrame] = None
 _last_load_ts: float = 0.0
 
-# Индексы поиска и картинок
+# Индексы
 _search_index: Dict[str, Set[int]] = {}
-_image_index: Dict[str, str] = {}
-
-# Индексы «точных» кодов (ускоряет и повышает точность)
 _code_index: Dict[str, List[int]] = {}
 _oem_index:  Dict[str, List[int]] = {}
+_image_index: Dict[str, str] = {}
 
-# Состояния и доступы
+# Состояния/доступы
 user_state: Dict[int, dict] = {}
 issue_state: Dict[int, dict] = {}
-
 SHEET_ALLOWED: Set[int] = set()
 SHEET_ADMINS:  Set[int] = set()
 SHEET_BLOCKED: Set[int] = set()
@@ -63,7 +59,6 @@ SHEET_BLOCKED: Set[int] = set()
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
 # ---------- Нормализация ----------
-# Кириллица→латиница для «двойников» (важно для УЗ/РУ данных)
 LOOKALIKES = str.maketrans({
     "А":"A","В":"B","Е":"E","К":"K","М":"M","Н":"H","О":"O","Р":"P","С":"C","Т":"T","У":"Y","Х":"X",
     "а":"a","е":"e","о":"o","р":"p","с":"c","у":"y","х":"x","к":"k","м":"m","н":"h","т":"t",
@@ -73,17 +68,16 @@ def _ascii_like(s: str) -> str:
     return (s or "").translate(LOOKALIKES)
 
 def _smart_o_to_zero(s: str) -> str:
-    """Меняем 'o'→'0' только когда 'o' стоит МЕЖДУ цифрами: 12o3 -> 1203."""
+    # Меняем 'o'→'0' только если буква 'o' стоит между цифрами: 12o3 -> 1203
     return re.sub(r'(?<=\d)o(?=\d)', '0', s)
 
 def _norm_code(x: str) -> str:
     """
-    Нормализация кодов:
-    - кир→лат
-    - lower
-    - smart 'o'→'0' (только между цифрами)
-    - убрать все символы кроме [a-z0-9]
+    Нормализация кодов/артикулов:
+    - кир→лат (двойники), lower
+    - 'o'→'0' только между цифрами
     - убрать пробелы/дефисы/подчёркивания/точки/слэши
+    - оставить только [a-z0-9]
     """
     s = _ascii_like(str(x or "").strip())
     s = s.lower()
@@ -103,19 +97,20 @@ def now_local_str(tz_name: str = TZ_NAME) -> str:
 def val(d: dict, key: str, default: str = "") -> str:
     return str(d.get(key, default) or default)
 
-def _url_name_tokens(url: str) -> List[str]:
-    try:
-        path = re.sub(r"[?#].*$", "", str(url or ""))
-        name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
-        return re.findall(r"[a-z0-9]+", _ascii_like(name))
-    except Exception:
-        return []
-
 def squash(text: str) -> str:
     return re.sub(r"[\W_]+", "", _ascii_like(str(text or "")).lower())
 
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", _ascii_like(str(text or "")).lower()).strip()
+
+def _url_name_tokens(url: str) -> List[str]:
+    try:
+        path = re.sub(r"[?#].*$", "", str(url or ""))
+        name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        name = _ascii_like(name)
+        return re.findall(r"[a-z0-9]+", name)
+    except Exception:
+        return []
 
 # ---------- Формат карточки (для справки) ----------
 def format_row(row: dict) -> str:
@@ -142,10 +137,12 @@ def get_gs_client():
         creds = Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIALS_JSON, scopes=SCOPES)
     return gspread.authorize(creds)
 
+def _open_ws(title: str):
+    sh = get_gs_client().open_by_url(SPREADSHEET_URL)
+    return sh.worksheet(title)
+
 def _load_sap_dataframe() -> pd.DataFrame:
-    client = get_gs_client()
-    sh = client.open_by_url(SPREADSHEET_URL)
-    ws = sh.worksheet(SAP_SHEET_NAME)
+    ws = _open_ws(SAP_SHEET_NAME)
     records = ws.get_all_records()
     new_df = pd.DataFrame(records)
     # нормализуем заголовки
@@ -156,7 +153,6 @@ def _load_sap_dataframe() -> pd.DataFrame:
             new_df[col] = new_df[col].astype(str).map(_norm_str)
     if "image" in new_df.columns:
         new_df["image"] = new_df["image"].astype(str).str.strip()
-    # поля с текстом — аккуратно
     for col in ("тип", "наименование", "изготовитель"):
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).map(_norm_str)
@@ -173,11 +169,9 @@ def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
                 core = _norm_code(raw)
                 if core:
                     idx.setdefault(core, set()).add(i)
-            # токены для полнотекстового поиска
             for t in re.findall(r"[a-z0-9]+", _ascii_like(raw.lower())):
-                if not t:
-                    continue
-                idx.setdefault(t, set()).add(i)
+                if t:
+                    idx.setdefault(t, set()).add(i)
     return idx
 
 def _rebuild_exact_code_indexes(df_: pd.DataFrame) -> None:
@@ -208,7 +202,6 @@ def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
             if t in skip or len(t) < 3:
                 continue
             index.setdefault(_norm_code(t), url)
-        # агрегат для частичного вхождения
         index.setdefault("".join(tokens), url)
     return index
 
@@ -220,10 +213,14 @@ def ensure_fresh_data(force: bool = False):
     new_df = _load_sap_dataframe()
     df = new_df
     _search_index = build_search_index(df)
-    _image_index = build_image_index(df)
     _rebuild_exact_code_indexes(df)
+    _image_index = build_image_index(df)
     _last_load_ts = time.time()
     logger.info(f"✅ Перезагружено {len(df)} строк, построены индексы")
+
+def sap_count() -> int:
+    ensure_fresh_data()
+    return 0 if df is None else len(df)
 
 # ---------- Картинки ----------
 async def find_image_by_code_async(code: str) -> str:
@@ -283,9 +280,8 @@ async def resolve_image_url_async(url_raw: str) -> str:
 # ---------- Поиск ----------
 def _tokenize_query(q: str) -> List[str]:
     q = _ascii_like(str(q or "").lower())
-    # вытащим коды без разделителей тоже (LR 7000 -> lr7000)
     tokens = re.findall(r"[a-z0-9]+", q)
-    joined = _norm_code(q)  # даёт склеенный вариант для кодов
+    joined = _norm_code(q)  # склеенный вариант для кодов (LR 7000 -> lr7000)
     if joined and joined not in tokens:
         tokens.append(joined)
     return [t for t in tokens if t]
@@ -298,7 +294,7 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
     if not tokens_norm:
         return set()
 
-    # Попробуем пересечение для «всех слов»
+    # Пересечение (все слова)
     sets: List[Set[int]] = []
     for t in tokens_norm:
         s = _search_index.get(t, set())
@@ -313,13 +309,16 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
         if acc:
             return acc
 
-    # иначе — объединение (хоть что-то)
+    # Иначе объединение
     found = set()
     for t in tokens_norm:
         found |= _search_index.get(t, set())
     return found
 
 def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: str) -> float:
+    """
+    Ранжирование: приоритет точного кода/ОЕМ, затем подстроки в ключевых полях.
+    """
     tkns = [_norm_str(t) for t in tokens if t]
     if not tkns:
         return 0.0
@@ -353,7 +352,7 @@ def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: str) -
         elif q_code and (q_code in _norm_code(code) or q_code in _norm_code(oem)):
             score += 30.0
 
-    # лёгкие бонусы
+    # лёгкие бонусы за начало строки
     q_full = " ".join(tkns)
     q_full_no_ws = squash(q_full)
     if code:
@@ -375,7 +374,6 @@ def find_rows(query: str, limit: int = 20) -> List[int]:
     tokens = _tokenize_query(query)
     candidates = list(match_row_by_index(tokens))
 
-    # если индекс ничего не дал — мягкий линейный проход
     if not candidates:
         candidates = list(range(len(df)))
 
@@ -383,14 +381,12 @@ def find_rows(query: str, limit: int = 20) -> List[int]:
     q_code   = _norm_code(query)
 
     scored: List[Tuple[float, int]] = []
-    # работаем с .iloc для скорости
     for i in candidates:
         row = df.iloc[i].to_dict()
         sc = _relevance_score(row, tokens, q_squash, q_code)
         if sc > 0:
             scored.append((sc, i))
 
-    # если вообще ничего не совпало — отдаём первые limit
     if not scored:
         return candidates[:limit]
 
@@ -449,9 +445,7 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
     admins:  Set[int] = set()
     blocked: Set[int] = set()
     try:
-        client = get_gs_client()
-        sh = client.open_by_url(SPREADSHEET_URL)
-        ws = sh.worksheet(USERS_SHEET_NAME)
+        ws = _open_ws(USERS_SHEET_NAME)
     except Exception:
         logger.info("Лист пользователей отсутствует — пускаем всех по умолчанию")
         return allowed, admins, blocked
@@ -500,10 +494,9 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
         allowed.add(uid)
     return allowed, admins, blocked
 
-# ---------- Запись в листы (по желанию) ----------
+# ---------- Запись в листы ----------
 def _append_row(ws_title: str, values: List[Any]) -> None:
-    ws = get_gs_client().open_by_url(SPREADSHEET_URL).worksheet(ws_title)
-    # до 3 попыток на случай rate-limit/сетевых глитчей
+    ws = _open_ws(ws_title)
     for attempt in range(3):
         try:
             ws.append_row(values, value_input_option="USER_ENTERED")
@@ -522,7 +515,6 @@ def _append_row(ws_title: str, values: List[Any]) -> None:
             raise
 
 def record_user(user_id: int, first_name: str, username: str, query: str) -> None:
-    """Записать визит/поиск пользователя в лист 'Пользователи' (если используешь)."""
     try:
         tz = ZoneInfo(TZ_NAME)
         now = datetime.now(tz)
@@ -530,8 +522,7 @@ def record_user(user_id: int, first_name: str, username: str, query: str) -> Non
         time_str = now.strftime("%H:%M:%S")
         username = (username or "").lstrip("@")
 
-        # создадим заголовок при первом запуске
-        ws = get_gs_client().open_by_url(SPREADSHEET_URL).worksheet(USERS_SHEET_NAME)
+        ws = _open_ws(USERS_SHEET_NAME)
         header = ws.row_values(1)
         if not header:
             ws.insert_row(["ID", "Имя", "Юзернейм", "Дата", "Время", "TZ", "Запрос"], 1)
@@ -544,22 +535,25 @@ def record_user(user_id: int, first_name: str, username: str, query: str) -> Non
         logger.exception("Ошибка записи в 'Пользователи'")
 
 def record_history(user_id: int, title_or_code: str, quantity: Any, comment: str) -> None:
-    """Записать событие в лист 'История' (если используешь списания/выборы)."""
     try:
         tz = ZoneInfo(TZ_NAME)
         now = datetime.now(tz)
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M:%S")
 
-        ws = get_gs_client().open_by_url(SPREADSHEET_URL).worksheet(HISTORY_SHEET_NAME)
+        ws = _open_ws(HISTORY_SHEET_NAME)
         header = ws.row_values(1)
         if not header:
             ws.insert_row(
                 ["Дата", "Время", "TZ", "Название/Код", "Кол-во", "Комментарий", "UserID"], 1
             )
+
         _append_row(HISTORY_SHEET_NAME, [
-            date_str, time_str, TZ_NAME, title_or_code or "",
-            quantity if quantity is not None else "", comment or "", user_id,
+            date_str, time_str, TZ_NAME,
+            title_or_code or "",
+            quantity if quantity is not None else "",
+            comment or "",
+            user_id,
         ])
     except Exception:
         logger.exception("Ошибка записи в 'История'")
@@ -570,7 +564,7 @@ async def asyncio_to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-# ---------- Init ----------
+# ---------- Инициализация ----------
 def initial_load():
     try:
         ensure_fresh_data(force=True)
@@ -598,4 +592,3 @@ async def initial_load_async():
         SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
     except Exception as e:
         logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
-
