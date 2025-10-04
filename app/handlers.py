@@ -279,7 +279,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Нет активной операции.")
 
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def export_cmd(update: Update, Context):
     uid = update.effective_user.id
     st = data.user_state.get(uid, {})
     results = st.get("results")
@@ -336,8 +336,10 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
         await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None: return
-    if context.chat_data.pop("suppress_next_search", False): return
+    if update.message is None:
+        return
+    if context.chat_data.pop("suppress_next_search", False):
+        return
 
     uid = update.effective_user.id
     st_issue = data.issue_state.get(uid)
@@ -357,7 +359,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return await update.message.reply_text("Введите запрос.")
 
-    # Базовые токены + фраза
+    # Базовые токены и "склеенная" фраза
     tokens = data.normalize(q).split()
     q_squash = data.squash(q)
     norm_code = data._norm_code(q)  # "LR 7000" -> "lr7000"
@@ -369,20 +371,14 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Ошибка загрузки данных.")
     df_ = data.df
 
-    matched_indices = set()
-
-    # 1) Если запрос содержит пробел и norm_code есть в индексе — используем ТОЛЬКО его
-    if " " in q and norm_code and norm_code in data._search_index:
-        matched_indices = set(data._search_index.get(norm_code, set()))
+    # --- Поисковая стратегия ---
+    # 1) Если можно получить нормализованный код — ищем строго по нему (индекс)
+    if norm_code:
+        matched_indices = data.match_row_by_index([norm_code])
     else:
-        # 2) Иначе обычный индексный поиск (он делает AND по токенам)
-        #    Добавляем norm_code как усилитель только если нет пробелов в запросе
-        idx_tokens = tokens.copy()
-        if not (" " in q) and norm_code:
-            idx_tokens.append(norm_code)
-        matched_indices = data.match_row_by_index(idx_tokens)
+        matched_indices = data.match_row_by_index(tokens)
 
-    # 3) Если индекс ничего не дал — фолбэк: AND внутри поля, OR по полям
+    # 2) Фолбэк: AND внутри поля, OR по полям
     if not matched_indices:
         mask_any = pd.Series(False, index=df_.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
@@ -399,8 +395,8 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mask_any |= field_mask
         matched_indices = set(df_.index[mask_any])
 
+    # 3) Ещё фолбэк: непрерывная фраза в склеенных полях
     if not matched_indices and q_squash:
-        # 4) Ещё фолбэк: непрерывная фраза в склеенных полях
         mask_any = pd.Series(False, index=df_.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
             series = data._safe_col(df_, col)
@@ -414,22 +410,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
     results_df = df_.loc[list(matched_indices)].copy()
-
-    # 5) Если в запросе был пробел (фраза), сузим широкие попадания:
-    if " " in q and norm_code:
-        def row_ok(r):
-            code_ok = data._norm_code(str(r.get("код", ""))) == norm_code
-            if code_ok: return True
-            # фразовое совпадение в любом поле без знаков
-            for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
-                v = str(r.get(col, "")).lower()
-                if not v: continue
-                if data.squash(v).find(q_squash) >= 0:
-                    return True
-            return False
-        results_df = results_df[results_df.apply(row_ok, axis=1)]
-        if results_df.empty:
-            return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
     # Сортировка по релевантности
     scores = []
