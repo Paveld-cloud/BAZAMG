@@ -4,7 +4,7 @@ import re
 import time
 import json
 import logging
-from typing import Dict, Set, Tuple, List, Optional, Any
+from typing import Dict, Set, Tuple, List, Optional
 
 import pandas as pd
 import aiohttp
@@ -21,19 +21,15 @@ try:
         SPREADSHEET_URL,
         SAP_SHEET_NAME,          # "SAP"
         USERS_SHEET_NAME,        # "Пользователи"
-        HISTORY_SHEET_NAME,      # "История"
         DATA_TTL,
         SEARCH_COLUMNS,
-        TZ_NAME,
     )
 except Exception:
-    SPREADSHEET_URL    = os.getenv("SPREADSHEET_URL", "")
-    SAP_SHEET_NAME     = os.getenv("SAP_SHEET_NAME", "SAP")
-    USERS_SHEET_NAME   = os.getenv("USERS_SHEET_NAME", "Пользователи")
-    HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "История")
-    DATA_TTL           = int(os.getenv("DATA_TTL", "600"))
-    TZ_NAME            = os.getenv("TIMEZONE", "Asia/Tashkent")
-    SEARCH_COLUMNS     = ["тип","наименование","код","oem","изготовитель","парт номер","oem парт номер"]
+    SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "")
+    SAP_SHEET_NAME = os.getenv("SAP_SHEET_NAME", "SAP")
+    USERS_SHEET_NAME = os.getenv("USERS_SHEET_NAME", "Пользователи")
+    DATA_TTL = int(os.getenv("DATA_TTL", "600"))
+    SEARCH_COLUMNS = ["тип","наименование","код","oem","изготовитель","парт номер","oem парт номер"]
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -41,69 +37,73 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # ---------- Глобальное состояние ----------
 df: Optional[pd.DataFrame] = None
 _last_load_ts: float = 0.0
-
-# Индексы
 _search_index: Dict[str, Set[int]] = {}
-_code_index: Dict[str, List[int]] = {}
-_oem_index:  Dict[str, List[int]] = {}
 _image_index: Dict[str, str] = {}
 
-# Состояния (если где-то используются)
 user_state: Dict[int, dict] = {}
 issue_state: Dict[int, dict] = {}
+
 SHEET_ALLOWED: Set[int] = set()
-SHEET_ADMINS:  Set[int] = set()
+SHEET_ADMINS: Set[int] = set()
 SHEET_BLOCKED: Set[int] = set()
 
 ASK_QUANTITY, ASK_COMMENT, ASK_CONFIRM = range(3)
 
-# ---------- Нормализация ----------
-LOOKALIKES = str.maketrans({
-    "А":"A","В":"B","Е":"E","К":"K","М":"M","Н":"H","О":"O","Р":"P","С":"C","Т":"T","У":"Y","Х":"X",
-    "а":"a","е":"e","о":"o","р":"p","с":"c","у":"y","х":"x","к":"k","м":"m","н":"h","т":"t",
-})
-
-def _ascii_like(s: str) -> str:
-    return (s or "").translate(LOOKALIKES)
-
-def _smart_o_to_zero(s: str) -> str:
-    # Меняем 'o'→'0' только если 'o' стоит между цифрами: 12o3 -> 1203
-    return re.sub(r'(?<=\d)o(?=\d)', '0', s)
-
+# ---------- Утилиты ----------
 def _norm_code(x: str) -> str:
-    """Нормализация кодов/артикулов: кир→лат, lower, smart 'o'→'0', убрать разделители и оставить [a-z0-9]."""
-    s = _ascii_like(str(x or "").strip())
-    s = s.lower()
-    s = _smart_o_to_zero(s)
-    s = re.sub(r"[\s\-_\.\/\\]+", "", s)
+    """
+    Нормализация кодов:
+    - lower
+    - заменить букву 'o' на цифру '0'
+    - убрать все символы кроме [a-z0-9]
+    """
+    s = str(x or "").strip().lower()
+    s = s.replace("o", "0")  # буква O → цифра 0
     s = re.sub(r"[^a-z0-9]", "", s)
     return s
 
 def _norm_str(x: str) -> str:
-    s = _ascii_like(str(x or "").strip())
-    return s.lower()
+    return str(x or "").strip().lower()
 
-def now_local_str(tz_name: str = TZ_NAME) -> str:
+def now_local_str(tz_name: str = "Asia/Tashkent") -> str:
     tz = ZoneInfo(tz_name)
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def val(d: dict, key: str, default: str = "") -> str:
     return str(d.get(key, default) or default)
 
-def squash(text: str) -> str:
-    return re.sub(r"[\W_]+", "", _ascii_like(str(text or "")).lower())
-
-def normalize(text: str) -> str:
-    return re.sub(r"[^\w\s]", "", _ascii_like(str(text or "")).lower()).strip()
-
 def _url_name_tokens(url: str) -> List[str]:
     try:
         path = re.sub(r"[?#].*$", "", str(url or ""))
         name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
-        name = _ascii_like(name)
         return re.findall(r"[a-z0-9]+", name)
     except Exception:
         return []
+
+def _safe_col(df_: pd.DataFrame, col: str) -> Optional[pd.Series]:
+    if col not in df_.columns:
+        return None
+    return df_[col].astype(str).fillna("").str.strip().str.lower()
+
+def squash(text: str) -> str:
+    return re.sub(r"[\W_]+", "", str(text or "").lower())
+
+def normalize(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
+
+# ---------- Формат карточки ----------
+def format_row(row: dict) -> str:
+    return (
+        f"🔹 Тип: {val(row, 'тип')}\n"
+        f"📦 Наименование: {val(row, 'наименование')}\n"
+        f"🔢 Код: {val(row, 'код')}\n"
+        f"🔢 Парт Номер: {val(row, 'парт номер')}\n"
+        f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}\n"
+        f"📦 Кол-во: {val(row, 'количество')}\n"
+        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}\n"
+        f"🏭 Изготовитель: {val(row, 'изготовитель')}\n"
+        f"⚙️ OEM: {val(row, 'oem')}"
+    )
 
 # ---------- Google Sheets ----------
 def get_gs_client():
@@ -116,23 +116,18 @@ def get_gs_client():
         creds = Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIALS_JSON, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def _open_ws(title: str):
-    sh = get_gs_client().open_by_url(SPREADSHEET_URL)
-    return sh.worksheet(title)
-
 def _load_sap_dataframe() -> pd.DataFrame:
-    ws = _open_ws(SAP_SHEET_NAME)
+    client = get_gs_client()
+    sh = client.open_by_url(SPREADSHEET_URL)
+    ws = sh.worksheet(SAP_SHEET_NAME)
     records = ws.get_all_records()
     new_df = pd.DataFrame(records)
     new_df.columns = [c.strip().lower() for c in new_df.columns]
     for col in ("код", "oem", "парт номер", "oem парт номер"):
         if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).map(_norm_str)
+            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
     if "image" in new_df.columns:
         new_df["image"] = new_df["image"].astype(str).str.strip()
-    for col in ("тип", "наименование", "изготовитель"):
-        if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).map(_norm_str)
     return new_df
 
 # ---------- Индексы ----------
@@ -141,29 +136,16 @@ def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
     cols = [c for c in SEARCH_COLUMNS if c in df_.columns]
     for i, row in df_.iterrows():
         for c in cols:
-            raw = str(row.get(c, ""))
+            val = str(row.get(c, "")).lower()
             if c in ("код", "парт номер", "oem парт номер"):
-                core = _norm_code(raw)
-                if core:
-                    idx.setdefault(core, set()).add(i)
-            for t in re.findall(r"[a-z0-9]+", _ascii_like(raw.lower())):
+                norm = _norm_code(val)
+                if norm:
+                    idx.setdefault(norm, set()).add(i)
+            for t in re.findall(r"[a-z0-9]+", val):
+                t = _norm_str(t)
                 if t:
                     idx.setdefault(t, set()).add(i)
     return idx
-
-def _rebuild_exact_code_indexes(df_: pd.DataFrame) -> None:
-    _code_index.clear()
-    _oem_index.clear()
-    if "код" in df_.columns:
-        for i, v in df_["код"].items():
-            key = _norm_code(v)
-            if key:
-                _code_index.setdefault(key, []).append(i)
-    if "oem парт номер" in df_.columns:
-        for i, v in df_["oem парт номер"].items():
-            key = _norm_code(v)
-            if key:
-                _oem_index.setdefault(key, []).append(i)
 
 def build_image_index(df_: pd.DataFrame) -> Dict[str, str]:
     index: Dict[str, str] = {}
@@ -190,14 +172,9 @@ def ensure_fresh_data(force: bool = False):
     new_df = _load_sap_dataframe()
     df = new_df
     _search_index = build_search_index(df)
-    _rebuild_exact_code_indexes(df)
     _image_index = build_image_index(df)
     _last_load_ts = time.time()
-    logger.info(f"✅ Перезагружено {len(df)} строк, построены индексы")
-
-def sap_count() -> int:
-    ensure_fresh_data()
-    return 0 if df is None else len(df)
+    logger.info(f"✅ Перезагружено {len(df)} строк и построены индексы")
 
 # ---------- Картинки ----------
 async def find_image_by_code_async(code: str) -> str:
@@ -255,14 +232,6 @@ async def resolve_image_url_async(url_raw: str) -> str:
     return url
 
 # ---------- Поиск ----------
-def _tokenize_query(q: str) -> List[str]:
-    q = _ascii_like(str(q or "").lower())
-    tokens = re.findall(r"[a-z0-9]+", q)
-    joined = _norm_code(q)  # склеенный вариант для кодов (LR 7000 -> lr7000)
-    if joined and joined not in tokens:
-        tokens.append(joined)
-    return [t for t in tokens if t]
-
 def match_row_by_index(tokens: List[str]) -> Set[int]:
     ensure_fresh_data()
     if not tokens:
@@ -270,8 +239,6 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
     tokens_norm = [_norm_code(t) for t in tokens if t]
     if not tokens_norm:
         return set()
-
-    # Пересечение (все слова)
     sets: List[Set[int]] = []
     for t in tokens_norm:
         s = _search_index.get(t, set())
@@ -283,100 +250,43 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
         acc = sets[0].copy()
         for s in sets[1:]:
             acc &= s
-        if acc:
-            return acc
-
-    # Иначе объединение
+        return acc
     found = set()
     for t in tokens_norm:
         found |= _search_index.get(t, set())
     return found
 
-def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: Optional[str] = None) -> float:
-    """Ранжирование: приоритет точного кода/ОЕМ, затем подстроки в ключевых полях."""
+def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> float:
     tkns = [_norm_str(t) for t in tokens if t]
     if not tkns:
         return 0.0
-
     code = _norm_str(row.get("код", ""))
     name = _norm_str(row.get("наименование", ""))
-    ttype= _norm_str(row.get("тип", ""))
+    ttype = _norm_str(row.get("тип", ""))
     oem  = _norm_str(row.get("oem", ""))
     manuf= _norm_str(row.get("изготовитель", ""))
-
     weights = {"код": 5.0, "наименование": 3.0, "тип": 2.0, "oem": 2.0, "изготовитель": 2.0}
-    fields  = {"код": code, "наименование": name, "тип": ttype, "oem": oem, "изготовитель": manuf}
-
+    fields = {"код": code, "наименование": name, "тип": ttype, "oem": oem, "изготовитель": manuf}
     score = 0.0
     for f, text in fields.items():
         for t in tkns:
             if t and (t in text):
                 score += weights[f]
-
     if q_squash:
         joined = squash(code + name + ttype + oem + manuf)
         if q_squash in joined:
             score += 10.0
-
-    # приоритет точного кода/оема, если передали q_code
-    if q_code:
-        if _norm_code(code) == q_code or _norm_code(oem) == q_code:
-            score += 100.0
-        elif q_code and (q_code == squash(code) or q_code == squash(oem)):
-            score += 60.0
-        elif q_code and (q_code in _norm_code(code) or q_code in _norm_code(oem)):
-            score += 30.0
-
-    # лёгкие бонусы за начало строки
     q_full = " ".join(tkns)
     q_full_no_ws = squash(q_full)
     if code:
         if code == q_full:
-            score += 20.0
+            score += 100.0
         if code.startswith(q_full) or code.startswith(q_full_no_ws):
-            score += 10.0
+            score += 20.0
         for t in tkns:
-            if t and code.startswith(t):
-                score += 3.0
+            if code.startswith(t):
+                score += 5.0
     return score
-
-def find_rows(query: str, limit: int = 20) -> List[int]:
-    """Вернёт индексы строк df под запрос (с сортировкой по релевантности)."""
-    ensure_fresh_data()
-    if df is None or df.empty:
-        return []
-
-    tokens = _tokenize_query(query)
-    candidates = list(match_row_by_index(tokens))
-    if not candidates:
-        candidates = list(range(len(df)))
-
-    q_squash = squash(query)
-    q_code   = _norm_code(query)
-
-    scored: List[Tuple[float, int]] = []
-    for i in candidates:
-        row = df.iloc[i].to_dict()
-        sc = _relevance_score(row, tokens, q_squash, q_code)
-        if sc > 0:
-            scored.append((sc, i))
-
-    if not scored:
-        return candidates[:limit]
-
-    scored.sort(key=lambda t: t[0], reverse=True)
-    return [i for _, i in scored[:limit]]
-
-def get_row(i: int) -> Dict[str, Any]:
-    ensure_fresh_data()
-    if df is None or df.empty or i < 0 or i >= len(df):
-        return {}
-    row = df.iloc[int(i)]
-    return {k: ("" if pd.isna(v) else v) for k, v in row.to_dict().items()}
-
-def find_items(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    idxs = find_rows(query, limit=limit)
-    return [get_row(i) for i in idxs]
 
 # ---------- Экспорт ----------
 def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
@@ -386,7 +296,7 @@ def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# ---------- Пользователи / доступ ----------
+# ---------- Пользователи ----------
 def _parse_int(x) -> Optional[int]:
     try:
         v = int(str(x).strip())
@@ -416,18 +326,18 @@ def _dedupe_headers(headers: List[str]) -> List[str]:
 
 def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
     allowed: Set[int] = set()
-    admins:  Set[int] = set()
+    admins: Set[int] = set()
     blocked: Set[int] = set()
     try:
-        ws = _open_ws(USERS_SHEET_NAME)
+        client = get_gs_client()
+        sh = client.open_by_url(SPREADSHEET_URL)
+        ws = sh.worksheet(USERS_SHEET_NAME)
     except Exception:
         logger.info("Лист пользователей отсутствует — пускаем всех по умолчанию")
         return allowed, admins, blocked
-
     all_vals = ws.get_all_values()
     if not all_vals:
         return allowed, admins, blocked
-
     headers_raw = all_vals[0]
     headers = _dedupe_headers(headers_raw)
     rows = all_vals[1:]
@@ -436,16 +346,13 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
         recs.append({headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))})
     dfu = pd.DataFrame(recs)
     dfu.columns = [c.strip().lower() for c in dfu.columns]
-
-    has_role     = "role" in dfu.columns
-    has_allowed  = "allowed" in dfu.columns
-    has_admin    = "admin" in dfu.columns
-    has_blocked  = "blocked" in dfu.columns
-
+    has_role = "role" in dfu.columns
+    has_allowed = "allowed" in dfu.columns
+    has_admin = "admin" in dfu.columns
+    has_blocked = "blocked" in dfu.columns
     def truthy(v) -> bool:
         s = str(v).strip().lower()
-        return s in ("1", "true", "да", "y", "yes", "ok", "ок")
-
+        return s in ("1", "true", "да", "y", "yes")
     for _, r in dfu.iterrows():
         uid = _parse_int(r.get("user_id") or r.get("uid") or r.get("id"))
         if not uid:
@@ -468,81 +375,13 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
         allowed.add(uid)
     return allowed, admins, blocked
 
-# ---------- Запись в листы ----------
-def _append_row(ws_title: str, values: List[Any]) -> None:
-    ws = _open_ws(ws_title)
-    for attempt in range(3):
-        try:
-            ws.append_row(values, value_input_option="USER_ENTERED")
-            return
-        except gspread.exceptions.APIError as e:
-            msg = str(e)
-            if any(x in msg for x in ("429", "500", "502", "503", "504")) and attempt < 2:
-                sleep_s = 2 * (attempt + 1)
-                logger.warning(f"Google API {msg}, ретрай через {sleep_s}s")
-                time.sleep(sleep_s)
-                continue
-            logger.exception("Ошибка Google API при append_row")
-            raise
-        except Exception:
-            logger.exception("Неожиданная ошибка при append_row")
-            raise
-
-def record_user(user_id: int, first_name: str, username: str, query: str) -> None:
-    try:
-        tz = ZoneInfo(TZ_NAME)
-        now = datetime.now(tz)
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
-        username = (username or "").lstrip("@")
-
-        ws = _open_ws(USERS_SHEET_NAME)
-        header = ws.row_values(1)
-        if not header:
-            ws.insert_row(["ID", "Имя", "Юзернейм", "Дата", "Время", "TZ", "Запрос"], 1)
-
-        _append_row(USERS_SHEET_NAME, [
-            user_id, first_name or "", username or "",
-            date_str, time_str, TZ_NAME, query or "",
-        ])
-    except Exception:
-        logger.exception("Ошибка записи в 'Пользователи'")
-
-def record_history(user_id: int, title_or_code: str, quantity: Any, comment: str) -> None:
-    try:
-        tz = ZoneInfo(TZ_NAME)
-        now = datetime.now(tz)
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
-
-        ws = _open_ws(HISTORY_SHEET_NAME)
-        header = ws.row_values(1)
-        if not header:
-            ws.insert_row(
-                ["Дата", "Время", "TZ", "Название/Код", "Кол-во", "Комментарий", "UserID"], 1
-            )
-
-        _append_row(HISTORY_SHEET_NAME, [
-            date_str, time_str, TZ_NAME,
-            title_or_code or "",
-            quantity if quantity is not None else "",
-            comment or "",
-            user_id,
-        ])
-    except Exception:
-        logger.exception("Ошибка записи в 'История'")
-
 # ---------- Async helper ----------
 import asyncio
 async def asyncio_to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-async def ensure_fresh_data_async(force: bool = False):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, lambda: ensure_fresh_data(force))
-
-# ---------- Инициализация ----------
+# ---------- Backward-compat ----------
 def initial_load():
     try:
         ensure_fresh_data(force=True)
@@ -552,7 +391,7 @@ def initial_load():
     try:
         allowed, admins, blocked = load_users_from_sheet()
         SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
-        SHEET_ADMINS.clear();  SHEET_ADMINS.update(admins)
+        SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
         SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
     except Exception as e:
         logger.warning(f"initial_load: не удалось загрузить пользователей: {e}")
@@ -566,7 +405,8 @@ async def initial_load_async():
     try:
         allowed, admins, blocked = await asyncio_to_thread(load_users_from_sheet)
         SHEET_ALLOWED.clear(); SHEET_ALLOWED.update(allowed)
-        SHEET_ADMINS.clear();  SHEET_ADMINS.update(admins)
+        SHEET_ADMINS.clear(); SHEET_ADMINS.update(admins)
         SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
     except Exception as e:
         logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
+
