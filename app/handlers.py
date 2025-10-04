@@ -655,5 +655,3 @@ def register_handlers(app):
 
     # Поиск
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
-
-
