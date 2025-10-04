@@ -406,17 +406,32 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.message.text.strip()
     if not q:
         return await update.message.reply_text("Введите запрос.")
+
+    # Базовые токены
     tokens = data.normalize(q).split()
-    if not tokens:
-        return await update.message.reply_text("Введите более конкретный запрос.")
     q_squash = data.squash(q)
 
+    # ✨ ВАЖНО: поддержка "LR 7000" → "lr7000"
+    norm_code = data._norm_code(q)  # заменяет O->0 и убирает пробелы/символы
+    if norm_code:
+        tokens.append(norm_code)
+
+    # Доп. склейка "lr" + "7000" → "lr7000"
+    if len(tokens) > 1:
+        tokens.append("".join(tokens))
+
+    # Убираем пустые и дубликаты, сохраняя порядок
+    seen = set()
+    tokens = [t for t in tokens if t and (t not in seen and not seen.add(t))]
+
+    # Гарантируем наличие данных
     if data.df is None:
-        await data.ensure_fresh_data_async(force=True)
+        await asyncio.to_thread(data.ensure_fresh_data, True)
         if data.df is None:
             return await update.message.reply_text("Ошибка загрузки данных.")
 
     df_ = data.df
+
     # Сначала — быстрый индекс
     matched_indices = data.match_row_by_index(tokens)
 
@@ -430,7 +445,11 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             field_mask = pd.Series(True, index=df_.index)
             for t in tokens:
                 if t:
-                    field_mask &= series.str_contains(re.escape(t), na=False) if hasattr(series, "str_contains") else series.str.contains(re.escape(t), na=False)
+                    # совместимость с разными версиями pandas
+                    if hasattr(series, "str_contains"):
+                        field_mask &= series.str_contains(re.escape(t), na=False)
+                    else:
+                        field_mask &= series.str.contains(re.escape(t), na=False)
             mask_any |= field_mask
         matched_indices = set(df_.index[mask_any])
 
@@ -707,3 +726,4 @@ def register_handlers(app):
 
     # Поиск
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
+
