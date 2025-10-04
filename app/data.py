@@ -1,4 +1,3 @@
-# app/data.py
 import os
 import io
 import re
@@ -49,7 +48,7 @@ _code_index: Dict[str, List[int]] = {}
 _oem_index:  Dict[str, List[int]] = {}
 _image_index: Dict[str, str] = {}
 
-# Состояния/доступы
+# Состояния (если где-то используются)
 user_state: Dict[int, dict] = {}
 issue_state: Dict[int, dict] = {}
 SHEET_ALLOWED: Set[int] = set()
@@ -68,17 +67,11 @@ def _ascii_like(s: str) -> str:
     return (s or "").translate(LOOKALIKES)
 
 def _smart_o_to_zero(s: str) -> str:
-    # Меняем 'o'→'0' только если буква 'o' стоит между цифрами: 12o3 -> 1203
+    # Меняем 'o'→'0' только если 'o' стоит между цифрами: 12o3 -> 1203
     return re.sub(r'(?<=\d)o(?=\d)', '0', s)
 
 def _norm_code(x: str) -> str:
-    """
-    Нормализация кодов/артикулов:
-    - кир→лат (двойники), lower
-    - 'o'→'0' только между цифрами
-    - убрать пробелы/дефисы/подчёркивания/точки/слэши
-    - оставить только [a-z0-9]
-    """
+    """Нормализация кодов/артикулов: кир→лат, lower, smart 'o'→'0', убрать разделители и оставить [a-z0-9]."""
     s = _ascii_like(str(x or "").strip())
     s = s.lower()
     s = _smart_o_to_zero(s)
@@ -112,20 +105,6 @@ def _url_name_tokens(url: str) -> List[str]:
     except Exception:
         return []
 
-# ---------- Формат карточки (для справки) ----------
-def format_row(row: dict) -> str:
-    return (
-        f"🔹 Тип: {val(row, 'тип')}\n"
-        f"📦 Наименование: {val(row, 'наименование')}\n"
-        f"🔢 Код: {val(row, 'код')}\n"
-        f"🔢 Парт Номер: {val(row, 'парт номер')}\n"
-        f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}\n"
-        f"📦 Кол-во: {val(row, 'количество')}\n"
-        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}\n"
-        f"🏭 Изготовитель: {val(row, 'изготовитель')}\n"
-        f"⚙️ OEM: {val(row, 'oem')}"
-    )
-
 # ---------- Google Sheets ----------
 def get_gs_client():
     if not GOOGLE_APPLICATION_CREDENTIALS_JSON:
@@ -145,9 +124,7 @@ def _load_sap_dataframe() -> pd.DataFrame:
     ws = _open_ws(SAP_SHEET_NAME)
     records = ws.get_all_records()
     new_df = pd.DataFrame(records)
-    # нормализуем заголовки
     new_df.columns = [c.strip().lower() for c in new_df.columns]
-    # важные колонки приводим к строкам и нормализуем
     for col in ("код", "oem", "парт номер", "oem парт номер"):
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).map(_norm_str)
@@ -315,10 +292,8 @@ def match_row_by_index(tokens: List[str]) -> Set[int]:
         found |= _search_index.get(t, set())
     return found
 
-def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: str) -> float:
-    """
-    Ранжирование: приоритет точного кода/ОЕМ, затем подстроки в ключевых полях.
-    """
+def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: Optional[str] = None) -> float:
+    """Ранжирование: приоритет точного кода/ОЕМ, затем подстроки в ключевых полях."""
     tkns = [_norm_str(t) for t in tokens if t]
     if not tkns:
         return 0.0
@@ -343,7 +318,7 @@ def _relevance_score(row: dict, tokens: List[str], q_squash: str, q_code: str) -
         if q_squash in joined:
             score += 10.0
 
-    # приоритет точного кода/оема
+    # приоритет точного кода/оема, если передали q_code
     if q_code:
         if _norm_code(code) == q_code or _norm_code(oem) == q_code:
             score += 100.0
@@ -373,7 +348,6 @@ def find_rows(query: str, limit: int = 20) -> List[int]:
 
     tokens = _tokenize_query(query)
     candidates = list(match_row_by_index(tokens))
-
     if not candidates:
         candidates = list(range(len(df)))
 
@@ -563,6 +537,10 @@ import asyncio
 async def asyncio_to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+async def ensure_fresh_data_async(force: bool = False):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: ensure_fresh_data(force))
 
 # ---------- Инициализация ----------
 def initial_load():
