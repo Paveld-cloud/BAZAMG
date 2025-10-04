@@ -7,7 +7,7 @@ import logging
 from html import escape
 
 import pandas as pd
-import aiohttp  # ← для байтового фолбэка изображений
+import aiohttp  # для байтового фолбэка изображений
 from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -104,7 +104,6 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     first = escape((user.first_name or "").strip() or "коллега")
 
-    # Красочное приветствие (текст)
     card_html = (
         f"⚙️ <b>Привет, {first}!</b>\n\n"
         f"Добро пожаловать в <b>бот для поиска деталей</b> 🛠️\n\n"
@@ -120,39 +119,19 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
         f"🚀 <i>Готов к работе — просто начните вводить!</i>"
     )
 
-    # Отправляем медиа + текст (caption). Если не получилось — фолбэк на текст.
     try:
         if WELCOME_MEDIA_ID:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=WELCOME_MEDIA_ID,
-                caption=card_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup(),
-            )
-            return
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, caption=card_html,
+                                         parse_mode="HTML", reply_markup=main_menu_markup()); return
         if WELCOME_PHOTO_URL:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=WELCOME_PHOTO_URL,
-                caption=card_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup(),
-            )
-            return
+            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, caption=card_html,
+                                         parse_mode="HTML", reply_markup=main_menu_markup()); return
         if WELCOME_ANIMATION_URL:
-            await context.bot.send_animation(
-                chat_id=chat_id,
-                animation=WELCOME_ANIMATION_URL,
-                caption=card_html,
-                parse_mode="HTML",
-                reply_markup=main_menu_markup(),
-            )
-            return
+            await context.bot.send_animation(chat_id=chat_id, animation=WELCOME_ANIMATION_URL, caption=card_html,
+                                             parse_mode="HTML", reply_markup=main_menu_markup()); return
     except Exception as e:
         logger.warning(f"Welcome message with media failed: {e}")
 
-    # Фолбэк: просто текст
     await _safe_send_html_message(context.bot, chat_id, card_html, reply_markup=main_menu_markup())
 
 # --------------------- /getfileid -----------------
@@ -169,17 +148,13 @@ async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     kind = None
 
     if msg.photo:
-        file_id = msg.photo[-1].file_id
-        kind = "фото"
+        file_id = msg.photo[-1].file_id; kind = "фото"
     elif msg.video:
-        file_id = msg.video.file_id
-        kind = "видео"
+        file_id = msg.video.file_id; kind = "видео"
     elif msg.animation:
-        file_id = msg.animation.file_id
-        kind = "анимация"
+        file_id = msg.animation.file_id; kind = "анимация"
     elif msg.document:
-        file_id = msg.document.file_id
-        kind = "документ"
+        file_id = msg.document.file_id; kind = "документ"
 
     if file_id:
         context.user_data["awaiting_fileid"] = False
@@ -193,13 +168,10 @@ async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --------------------- Фото карточки -----------------
 async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, reply_markup):
-    # 1) Пытаемся отправить как URL
     try:
         return await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"send_photo(url) failed: {e}")
-
-    # 2) Фолбэк: скачиваем байты и отправляем как файл
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -207,8 +179,7 @@ async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, r
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 content = await resp.read()
-        bio = io.BytesIO(content)
-        bio.name = "image.jpg"
+        bio = io.BytesIO(content); bio.name = "image.jpg"
         return await bot.send_photo(chat_id=chat_id, photo=InputFile(bio), caption=caption, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"byte fallback failed: {e}")
@@ -217,53 +188,43 @@ async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, r
 async def send_row_with_image(update: Update, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
-
     url_raw = await data.find_image_by_code_async(code)
     if not url_raw:
         logger.info(f"[image] нет записи в индексе для кода: {code}")
         return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
-
     url = await data.resolve_image_url_async(url_raw)
     if not url:
         logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
         return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
-
     sent = await _send_photo_with_fallback(update.get_bot(), update.effective_chat.id, url, text, kb)
-    if sent:
-        return
+    if sent: return
     logger.warning(f"[image] не удалось отправить фото для кода {code} (url={url})")
     await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
 
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
     code = str(row.get("код", "")).strip().lower()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
-
     url_raw = await data.find_image_by_code_async(code)
     if not url_raw:
         logger.info(f"[image] нет записи в индексе для кода: {code}")
         return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
-
     url = await data.resolve_image_url_async(url_raw)
     if not url:
         logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
         return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
-
     sent = await _send_photo_with_fallback(bot, chat_id, url, text, kb)
-    if sent:
-        return
+    if sent: return
     logger.warning(f"[image] не удалось отправить фото (bot) для кода {code} (url={url})")
     await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
 
 # --------------------- Меню (callbacks) -----------------
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
     await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     msg = (
         "<b>Как списать деталь</b>:\n"
         "1) Выполните поиск по названию/коду.\n"
@@ -274,15 +235,13 @@ async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
 async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     await q.message.reply_text(f"{SUPPORT_CONTACT}")
 
 # --------------------- Команды -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    data.issue_state.pop(uid, None)
-    data.user_state.pop(uid, None)
+    data.issue_state.pop(uid, None); data.user_state.pop(uid, None)
     await send_welcome_sequence(update, context)
     if update.message:
         await asyncio.sleep(0.2)
@@ -310,8 +269,7 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return await update.message.reply_text("Доступ запрещён.")
-    data.ensure_fresh_data(force=True)
-    ensure_users(force=True)
+    data.ensure_fresh_data(force=True); ensure_users(force=True)
     await update.message.reply_text("✅ Данные и пользователи перезагружены (в фоне).")
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,8 +300,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------- Поиск -----------------
 async def send_page(update: Update, uid: int):
     st = data.user_state.get(uid, {})
-    results = st.get("results")
-    page = st.get("page", 0)
+    results = st.get("results"); page = st.get("page", 0)
 
     total = len(results)
     if total == 0:
@@ -353,8 +310,7 @@ async def send_page(update: Update, uid: int):
         st["page"] = pages - 1
         return await update.message.reply_text("Больше результатов нет.")
 
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total)
+    start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
 
     await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
     for _, row in results.iloc[start:end].iterrows():
@@ -364,8 +320,7 @@ async def send_page(update: Update, uid: int):
 
 async def send_page_via_bot(bot, chat_id: int, uid: int):
     st = data.user_state.get(uid, {})
-    results = st.get("results")
-    page = st.get("page", 0)
+    results = st.get("results"); page = st.get("page", 0)
     total = len(results)
     if total == 0:
         return await bot.send_message(chat_id=chat_id, text="Результатов больше нет.")
@@ -373,21 +328,16 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
     if page >= pages:
         st["page"] = pages - 1
         return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total)
+    start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
     await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
-    chunk = results.iloc[start:end]
-    for _, row in chunk.iterrows():
+    for _, row in results.iloc[start:end].iterrows():
         await send_row_with_image_bot(bot, chat_id, row.to_dict(), data.format_row(row.to_dict()))
     if end < total:
         await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-
-    if context.chat_data.pop("suppress_next_search", False):
-        return
+    if update.message is None: return
+    if context.chat_data.pop("suppress_next_search", False): return
 
     uid = update.effective_user.id
     st_issue = data.issue_state.get(uid)
@@ -407,35 +357,32 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return await update.message.reply_text("Введите запрос.")
 
-    # Базовые токены
+    # Базовые токены + фраза
     tokens = data.normalize(q).split()
     q_squash = data.squash(q)
-
-    # ✨ ВАЖНО: поддержка "LR 7000" → "lr7000"
-    norm_code = data._norm_code(q)  # заменяет O->0 и убирает пробелы/символы
-    if norm_code:
-        tokens.append(norm_code)
-
-    # Доп. склейка "lr" + "7000" → "lr7000"
-    if len(tokens) > 1:
-        tokens.append("".join(tokens))
-
-    # Убираем пустые и дубликаты, сохраняя порядок
-    seen = set()
-    tokens = [t for t in tokens if t and (t not in seen and not seen.add(t))]
+    norm_code = data._norm_code(q)  # "LR 7000" -> "lr7000"
 
     # Гарантируем наличие данных
     if data.df is None:
         await asyncio.to_thread(data.ensure_fresh_data, True)
         if data.df is None:
             return await update.message.reply_text("Ошибка загрузки данных.")
-
     df_ = data.df
 
-    # Сначала — быстрый индекс
-    matched_indices = data.match_row_by_index(tokens)
+    matched_indices = set()
 
-    # Фолбэк: contains по полям
+    # 1) Если запрос содержит пробел и norm_code есть в индексе — используем ТОЛЬКО его
+    if " " in q and norm_code and norm_code in data._search_index:
+        matched_indices = set(data._search_index.get(norm_code, set()))
+    else:
+        # 2) Иначе обычный индексный поиск (он делает AND по токенам)
+        #    Добавляем norm_code как усилитель только если нет пробелов в запросе
+        idx_tokens = tokens.copy()
+        if not (" " in q) and norm_code:
+            idx_tokens.append(norm_code)
+        matched_indices = data.match_row_by_index(idx_tokens)
+
+    # 3) Если индекс ничего не дал — фолбэк: AND внутри поля, OR по полям
     if not matched_indices:
         mask_any = pd.Series(False, index=df_.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
@@ -445,7 +392,6 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             field_mask = pd.Series(True, index=df_.index)
             for t in tokens:
                 if t:
-                    # совместимость с разными версиями pandas
                     if hasattr(series, "str_contains"):
                         field_mask &= series.str_contains(re.escape(t), na=False)
                     else:
@@ -453,8 +399,8 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mask_any |= field_mask
         matched_indices = set(df_.index[mask_any])
 
-    # Ещё фолбэк: по "склеенному" значению
     if not matched_indices and q_squash:
+        # 4) Ещё фолбэк: непрерывная фраза в склеенных полях
         mask_any = pd.Series(False, index=df_.index)
         for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
             series = data._safe_col(df_, col)
@@ -467,12 +413,28 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matched_indices:
         return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
 
-    idx_list = list(matched_indices)
-    results_df = df_.loc[idx_list].copy()
+    results_df = df_.loc[list(matched_indices)].copy()
 
+    # 5) Если в запросе был пробел (фраза), сузим широкие попадания:
+    if " " in q and norm_code:
+        def row_ok(r):
+            code_ok = data._norm_code(str(r.get("код", ""))) == norm_code
+            if code_ok: return True
+            # фразовое совпадение в любом поле без знаков
+            for col in ["тип", "наименование", "код", "oem", "изготовитель"]:
+                v = str(r.get(col, "")).lower()
+                if not v: continue
+                if data.squash(v).find(q_squash) >= 0:
+                    return True
+            return False
+        results_df = results_df[results_df.apply(row_ok, axis=1)]
+        if results_df.empty:
+            return await update.message.reply_text(f"По запросу «{q}» ничего не найдено.")
+
+    # Сортировка по релевантности
     scores = []
     for _, r in results_df.iterrows():
-        scores.append(data._relevance_score(r.to_dict(), tokens, q_squash))
+        scores.append(data._relevance_score(r.to_dict(), tokens + ([norm_code] if norm_code else []), q_squash))
     results_df["__score"] = scores
 
     if "код" in results_df.columns:
@@ -486,9 +448,7 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results_df = results_df.drop(columns="__score")
 
     st = data.user_state.setdefault(uid, {})
-    st["query"] = q
-    st["results"] = results_df
-    st["page"] = 0
+    st["query"] = q; st["results"] = results_df; st["page"] = 0
 
     await send_page(update, uid)
 
@@ -503,9 +463,7 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ Списание -----------------
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
+    q = update.callback_query; await q.answer()
     uid = q.from_user.id
     code = q.data.split(":", 1)[1].strip().lower()
 
@@ -524,7 +482,6 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
-
     uid = update.effective_user.id
     text = (update.message.text or "").strip().replace(",", ".")
     try:
@@ -537,34 +494,28 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
             reply_markup=cancel_markup()
         )
-
     st = data.issue_state.get(uid)
     if not st or "part" not in st:
         return await update.message.reply_text("Списание неактивно — начните заново из карточки.")
-
-    st["quantity"] = qty
-    st["await_comment"] = True
+    st["quantity"] = qty; st["await_comment"] = True
     await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
     return data.ASK_COMMENT
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
-
     uid = update.effective_user.id
     comment = (update.message.text or "").strip()
     st = data.issue_state.get(uid)
     if not st:
         return await update.message.reply_text("Списание неактивно. Начните заново из карточки.")
 
-    part = st.get("part")
-    qty = st.get("quantity")
+    part = st.get("part"); qty = st.get("quantity")
     if part is None or qty is None:
         data.issue_state.pop(uid, None)
         return await update.message.reply_text("Что-то пошло не так. Попробуйте ещё раз.")
 
     st["comment"] = "" if comment == "-" else comment
     st["await_comment"] = False
-
     text = (
         "Вы уверены, что хотите списать деталь?\n\n"
         f"🔢 Код: {data.val(part, 'код')}\n"
@@ -576,10 +527,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return data.ASK_CONFIRM
 
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
-    # читаем напрямую из модулей
     from app.config import SPREADSHEET_URL
     import gspread
-
     client = data.get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
     try:
@@ -587,15 +536,11 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="История", rows=1000, cols=12)
         ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
-
-    headers_raw = ws.row_values(1)
-    headers = [h.strip() for h in headers_raw]
-    norm = [h.lower() for h in headers]
+    headers_raw = ws.row_values(1); headers = [h.strip() for h in headers_raw]; norm = [h.lower() for h in headers]
 
     full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
     display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
     ts = data.now_local_str()
-
     values_by_key = {
         "дата": ts, "timestamp": ts,
         "id": user.id, "user_id": user.id,
@@ -606,28 +551,21 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
         "数量": str(quantity), "количество": str(quantity), "qty": str(quantity),
         "коментарий": comment or "", "комментарий": comment or "", "comment": comment or "",
     }
-
     row = [values_by_key.get(hn, "") for hn in norm]
     ws.append_row(row, value_input_option="USER_ENTERED")
     logger.info("💾 Списание записано в 'История'")
 
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     uid = q.from_user.id
-
     if q.data == "confirm_yes":
         st = data.issue_state.get(uid)
         if not st or "part" not in st or "quantity" not in st:
             data.issue_state.pop(uid, None)
             return await q.message.reply_text("Данных для списания нет. Начните заново.")
-        part = st["part"]
-        qty = st["quantity"]
-        comment = st.get("comment", "")
-
+        part = st["part"]; qty = st["quantity"]; comment = st.get("comment", "")
         await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
         data.issue_state.pop(uid, None)
-
         await q.message.reply_text(
             f"✅ Списано: {qty}\n"
             f"🔢 Код: {data.val(part, 'код')}\n"
@@ -635,15 +573,13 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 Комментарий: {comment or '—'}"
         )
         return ConversationHandler.END
-
     if q.data == "confirm_no":
         data.issue_state.pop(uid, None)
         await q.message.reply_text("❌ Списание отменено.")
         return ConversationHandler.END
 
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     uid = q.from_user.id
     if uid in data.issue_state:
         data.issue_state.pop(uid, None)
@@ -655,8 +591,7 @@ async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     uid = q.from_user.id
     st = data.user_state.get(uid, {})
     results = st.get("results")
@@ -683,10 +618,7 @@ def register_handlers(app):
     # Новый хендлер для получения file_id
     app.add_handler(CommandHandler("getfileid", getfileid_cmd))
     app.add_handler(
-        MessageHandler(
-            (filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL),
-            media_fileid_handler
-        ),
+        MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL), media_fileid_handler),
         group=0
     )
 
@@ -717,13 +649,11 @@ def register_handlers(app):
             ],
         },
         fallbacks=[CommandHandler("cancel", handle_cancel_in_dialog)],
-        allow_reentry=True,
-        per_chat=True,
-        per_user=True,
-        per_message=False,
+        allow_reentry=True, per_chat=True, per_user=True, per_message=False,
     )
     app.add_handler(conv)
 
     # Поиск
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_text), group=1)
+
 
