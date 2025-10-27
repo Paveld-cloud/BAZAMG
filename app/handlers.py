@@ -42,7 +42,7 @@ def more_markup():
 
 def main_menu_markup():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search")],
+        # [InlineKeyboardButton("🔍 Поиск", callback_data="menu_search")],  # 🔕 убрали кнопку поиска
         [InlineKeyboardButton("📦 Как списать деталь", callback_data="menu_issue_help")],
         [InlineKeyboardButton("📞 Поддержка", callback_data="menu_contact")],
     ])
