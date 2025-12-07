@@ -95,19 +95,22 @@ def normalize(text: str) -> str:
 def format_row(row: dict) -> str:
     """
     Формирование текста карточки детали.
+
     Цена:
-      - если в исходном значении уже есть запятая -> показываем как есть (как в таблице);
-      - иначе, если это число -> форматируем:
-          < 1000  -> 573,90
-          >=1000  -> 28 161,05
+      - если в исходной строке уже есть запятая -> показываем как есть (как в таблице);
+      - иначе, если это число:
+          * если это «подозрительное» целое > 1000 и до 6 цифр
+            (типичный случай 57390 вместо 573,90) — восстанавливаем копейки;
+          * иначе форматируем стандартно:
+              < 1000  -> 573,90
+              >=1000  -> 57 390,00
     """
-    # исходные значения
     price_raw = val(row, "цена")
     currency = val(row, "валюта")
     price_str = str(price_raw).strip()
     price_fmt = price_str
 
-    # если в исходном тексте уже есть запятая — считаем, что формат из таблицы корректный
+    # если в исходном тексте уже есть запятая — доверяем формату таблицы
     if "," in price_str:
         price_fmt = price_str
     else:
@@ -115,12 +118,24 @@ def format_row(row: dict) -> str:
         if re.match(r"^\d+(\.\d+)?$", price_str):
             try:
                 num = float(price_str)
-                # малые числа — без разделения тысяч
-                if abs(num) < 1000:
-                    price_fmt = f"{num:.2f}".replace(".", ",")
+
+                # --- кейс искажённой цены 573,90 -> 57390 ----
+                # число целое (нет '.') и довольно короткое (до 6 цифр),
+                # но при этом > 1000 — похоже, что это цена вида ХХХ,YY
+                # которая была отформатирована в таблице.
+                if "." not in price_str and num > 1000 and len(price_str) <= 6:
+                    digits = re.sub(r"\D", "", price_str)
+                    if len(digits) >= 3:
+                        # 57390 -> "573,90"
+                        price_fmt = digits[:-2] + "," + digits[-2:]
+                    else:
+                        price_fmt = digits
                 else:
-                    # большие числа — с разделителем тысяч
-                    price_fmt = f"{num:,.2f}".replace(",", " ").replace(".", ",")
+                    # обычное форматирование
+                    if abs(num) < 1000:
+                        price_fmt = f"{num:.2f}".replace(".", ",")
+                    else:
+                        price_fmt = f"{num:,.2f}".replace(",", " ").replace(".", ",")
             except Exception:
                 price_fmt = price_str
 
@@ -440,4 +455,5 @@ async def initial_load_async():
         SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
     except Exception as e:
         logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
+
 
