@@ -104,7 +104,11 @@ def format_row(row: dict) -> str:
           * иначе форматируем стандартно:
               < 1000  -> 573,90
               >=1000  -> 57 390,00
+
+    Код:
+      - выводим в верхнем регистре для буквенно-цифровых кодов (uzcss01033 -> UZCSS01033)
     """
+    # ----- Цена -----
     price_raw = val(row, "цена")
     currency = val(row, "валюта")
     price_str = str(price_raw).strip()
@@ -122,7 +126,6 @@ def format_row(row: dict) -> str:
                 # --- кейс искажённой цены 573,90 -> 57390 ----
                 # число целое (нет '.') и довольно короткое (до 6 цифр),
                 # но при этом > 1000 — похоже, что это цена вида ХХХ,YY
-                # которая была отформатирована в таблице.
                 if "." not in price_str and num > 1000 and len(price_str) <= 6:
                     digits = re.sub(r"\D", "", price_str)
                     if len(digits) >= 3:
@@ -139,10 +142,17 @@ def format_row(row: dict) -> str:
             except Exception:
                 price_fmt = price_str
 
+    # ----- Код в красивом виде (верхний регистр) -----
+    code_original = str(row.get("код", "")).strip()
+    if code_original and code_original.isalnum():
+        code_display = code_original.upper()
+    else:
+        code_display = code_original
+
     return (
         f"🔹 Тип: {val(row, 'тип')}\n"
         f"📦 Наименование: {val(row, 'наименование')}\n"
-        f"🔢 Код: {val(row, 'код')}\n"
+        f"🔢 Код: {code_display}\n"
         f"🔢 Парт Номер: {val(row, 'парт номер')}\n"
         f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}\n"
         f"📦 Кол-во: {val(row, 'количество')}\n"
@@ -171,7 +181,8 @@ def _load_sap_dataframe() -> pd.DataFrame:
     new_df.columns = [c.strip().lower() for c in new_df.columns]
     for col in ("код", "oem", "парт номер", "oem парт номер"):
         if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).str.strip().str.lower()
+            # оставляем оригинальный регистр, только обрезаем пробелы
+            new_df[col] = new_df[col].astype(str).str.strip()
     if "image" in new_df.columns:
         new_df["image"] = new_df["image"].astype(str).str.strip()
     return new_df
@@ -455,5 +466,6 @@ async def initial_load_async():
         SHEET_BLOCKED.clear(); SHEET_BLOCKED.update(blocked)
     except Exception as e:
         logger.warning(f"initial_load_async: не удалось загрузить пользователей: {e}")
+
 
 
