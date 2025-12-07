@@ -93,6 +93,26 @@ def normalize(text: str) -> str:
 
 # ---------- Формат карточки ----------
 def format_row(row: dict) -> str:
+    """
+    Формирование текста карточки детали.
+    Добавлено красивое форматирование цены:
+    28161.05 -> 28 161,05
+    """
+    # Подготовка цены
+    price_raw = val(row, "цена")
+    currency = val(row, "валюта")
+    price_str = str(price_raw).strip()
+    price_fmt = price_str
+
+    # Если цена выглядит как число (int/float), форматируем: пробелы по разрядам, запятая как разделитель
+    if re.match(r"^\d+(\.\d+)?$", price_str):
+        try:
+            num = float(price_str)
+            # 28161.05 → "28,161.05" → "28 161,05"
+            price_fmt = f"{num:,.2f}".replace(",", " ").replace(".", ",")
+        except Exception:
+            price_fmt = price_str
+
     return (
         f"🔹 Тип: {val(row, 'тип')}\n"
         f"📦 Наименование: {val(row, 'наименование')}\n"
@@ -100,7 +120,7 @@ def format_row(row: dict) -> str:
         f"🔢 Парт Номер: {val(row, 'парт номер')}\n"
         f"⚙️ OEM Парт Номер: {val(row, 'oem парт номер')}\n"
         f"📦 Кол-во: {val(row, 'количество')}\n"
-        f"💰 Цена: {val(row, 'цена')} {val(row, 'валюта')}\n"
+        f"💰 Цена: {price_fmt} {currency}\n"
         f"🏭 Изготовитель: {val(row, 'изготовитель')}\n"
         f"⚙️ OEM: {val(row, 'oem')}"
     )
@@ -136,12 +156,12 @@ def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
     cols = [c for c in SEARCH_COLUMNS if c in df_.columns]
     for i, row in df_.iterrows():
         for c in cols:
-            val = str(row.get(c, "")).lower()
+            val_ = str(row.get(c, "")).lower()
             if c in ("код", "парт номер", "oem парт номер"):
-                norm = _norm_code(val)
+                norm = _norm_code(val_)
                 if norm:
                     idx.setdefault(norm, set()).add(i)
-            for t in re.findall(r"[a-z0-9]+", val):
+            for t in re.findall(r"[a-z0-9]+", val_):
                 t = _norm_str(t)
                 if t:
                     idx.setdefault(t, set()).add(i)
