@@ -1,5 +1,6 @@
 import logging
 from telegram.ext import ApplicationBuilder
+from telegram.constants import ParseMode   # <<< добавлено
 from app.config import TELEGRAM_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, PORT, WEBHOOK_SECRET_TOKEN, TZ_NAME
 from app.data import initial_load
 from app.handlers import register_handlers
@@ -9,13 +10,22 @@ logger = logging.getLogger("bot")
 
 def main():
     logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
-    if not WEBHOOK_SECRET_TOKEN:
+
+    # Проверка секретного токена для вебхука
+    if not WEBHOOK_SECRET_TOKEN:  # <<< исправлено, убран комментарий "добавь сам"
         logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется включить для продакшена.")
 
-    # Начальная синхронная загрузка
+    # Начальная синхронная загрузка данных
     initial_load()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # <<< ВАЖНО: включаем HTML по умолчанию
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .parse_mode(ParseMode.HTML)   # <<< теперь бот отправляет HTML-карточки как нужно
+        .build()
+    )
+
     register_handlers(app)
 
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -33,5 +43,5 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    main(
     
