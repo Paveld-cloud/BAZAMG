@@ -1,7 +1,6 @@
 import logging
 
 from telegram.ext import ApplicationBuilder
-from telegram.constants import ParseMode
 
 from app.config import (
     TELEGRAM_TOKEN,
@@ -24,28 +23,20 @@ logger = logging.getLogger("bot")
 def main() -> None:
     logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
 
-    # Предупреждение, если нет секретного токена вебхука
     if not WEBHOOK_SECRET_TOKEN:
         logger.warning(
             "WEBHOOK_SECRET_TOKEN не задан — "
             "рекомендуется включить для продакшена."
         )
 
-    # Начальная синхронная загрузка данных (таблица + пользователи)
+    # начальная загрузка данных (таблица + пользователи)
     initial_load()
 
-    # Строим приложение и сразу включаем HTML-разметку
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .parse_mode(ParseMode.HTML)   # <<< важно для <b>...</b> в карточках
-        .build()
-    )
+    # БЕЗ parse_mode – вернулись к стандартному builder’у
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Регистрируем все хендлеры
     register_handlers(app)
 
-    # Настройка вебхука
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     logger.info(f"🚀 Стартуем webhook-сервер на 0.0.0.0:{PORT}")
     logger.info(f"🌐 Устанавливаем webhook: {full_webhook}")
@@ -63,3 +54,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
