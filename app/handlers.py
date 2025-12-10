@@ -30,6 +30,7 @@ logger = logging.getLogger("bot.handlers")
 def cancel_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]])
 
+
 def confirm_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, списать", callback_data="confirm_yes"),
@@ -37,8 +38,10 @@ def confirm_markup():
         [InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")]
     ])
 
+
 def more_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Ещё", callback_data="more")]])
+
 
 def main_menu_markup():
     return InlineKeyboardMarkup([
@@ -49,6 +52,10 @@ def main_menu_markup():
 
 # ---------- Безопасная отправка HTML ----------
 async def _safe_send_html_message(bot, chat_id: int, text: str, **kwargs):
+    """
+    Универсальная отправка сообщения с HTML.
+    При ошибке парсинга HTML — пытаемся отправить текст без тегов.
+    """
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", **kwargs)
     except Exception as e:
@@ -64,12 +71,15 @@ async def ensure_users_async(force: bool = False):
     data.SHEET_ADMINS.clear(); data.SHEET_ADMINS.update(admins)
     data.SHEET_BLOCKED.clear(); data.SHEET_BLOCKED.update(blocked)
 
+
 def ensure_users(force: bool = False):
     asyncio.create_task(ensure_users_async(force=True))
+
 
 def is_admin(uid: int) -> bool:
     ensure_users()
     return uid in data.SHEET_ADMINS or uid in ADMINS
+
 
 def is_allowed(uid: int) -> bool:
     ensure_users()
@@ -88,6 +98,7 @@ async def guard_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         raise ApplicationHandlerStop
+
 
 async def guard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -121,14 +132,32 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         if WELCOME_MEDIA_ID:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_MEDIA_ID, caption=card_html,
-                                         parse_mode="HTML", reply_markup=main_menu_markup()); return
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=WELCOME_MEDIA_ID,
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
+            )
+            return
         if WELCOME_PHOTO_URL:
-            await context.bot.send_photo(chat_id=chat_id, photo=WELCOME_PHOTO_URL, caption=card_html,
-                                         parse_mode="HTML", reply_markup=main_menu_markup()); return
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=WELCOME_PHOTO_URL,
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
+            )
+            return
         if WELCOME_ANIMATION_URL:
-            await context.bot.send_animation(chat_id=chat_id, animation=WELCOME_ANIMATION_URL, caption=card_html,
-                                             parse_mode="HTML", reply_markup=main_menu_markup()); return
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=WELCOME_ANIMATION_URL,
+                caption=card_html,
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(),
+            )
+            return
     except Exception as e:
         logger.warning(f"Welcome message with media failed: {e}")
 
@@ -138,6 +167,7 @@ async def send_welcome_sequence(update: Update, context: ContextTypes.DEFAULT_TY
 async def getfileid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_fileid"] = True
     await update.message.reply_text("📸 Пришлите фото/анимацию/видео/документ одним сообщением — верну его file_id.")
+
 
 async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_fileid"):
@@ -168,10 +198,22 @@ async def media_fileid_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --------------------- Фото карточки -----------------
 async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, reply_markup):
+    """
+    Отправка фото с подписью + HTML. При ошибке с URL — фолбэк через байты.
+    """
+    # Пытаемся отправить по URL
     try:
-        return await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
+        return await bot.send_photo(
+            chat_id=chat_id,
+            photo=url,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
     except Exception as e:
         logger.warning(f"send_photo(url) failed: {e}")
+
+    # Фолбэк: скачиваем и отправляем как файл
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -179,52 +221,124 @@ async def _send_photo_with_fallback(bot, chat_id: int, url: str, caption: str, r
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 content = await resp.read()
-        bio = io.BytesIO(content); bio.name = "image.jpg"
-        return await bot.send_photo(chat_id=chat_id, photo=InputFile(bio), caption=caption, reply_markup=reply_markup)
+
+        bio = io.BytesIO(content)
+        bio.name = "image.jpg"
+        return await bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(bio),
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
     except Exception as e:
         logger.warning(f"byte fallback failed: {e}")
         return None
 
+
 async def send_row_with_image(update: Update, row: dict, text: str):
+    """
+    Отправка карточки через update: если есть фото — фото + caption (HTML),
+    если нет — текстовое сообщение через _safe_send_html_message.
+    """
     code = str(row.get("код", "")).strip().lower()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]]
+    )
+
+    bot = update.get_bot()
+    chat_id = update.effective_chat.id
+
+    # Пытаемся найти фото по коду
     url_raw = await data.find_image_by_code_async(code)
     if not url_raw:
         logger.info(f"[image] нет записи в индексе для кода: {code}")
-        return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
+        return await _safe_send_html_message(
+            bot,
+            chat_id,
+            "📄 (без фото)\n" + text,
+            reply_markup=kb,
+        )
+
     url = await data.resolve_image_url_async(url_raw)
     if not url:
         logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
-        return await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
-    sent = await _send_photo_with_fallback(update.get_bot(), update.effective_chat.id, url, text, kb)
-    if sent: return
+        return await _safe_send_html_message(
+            bot,
+            chat_id,
+            "📄 (без фото)\n" + text,
+            reply_markup=kb,
+        )
+
+    # Отправка фото с HTML-caption
+    sent = await _send_photo_with_fallback(bot, chat_id, url, text, kb)
+    if sent:
+        return
+
     logger.warning(f"[image] не удалось отправить фото для кода {code} (url={url})")
-    await update.message.reply_text("📄 (без фото)\n" + text, reply_markup=kb)
+    await _safe_send_html_message(
+        bot,
+        chat_id,
+        "📄 (без фото)\n" + text,
+        reply_markup=kb,
+    )
+
 
 async def send_row_with_image_bot(bot, chat_id: int, row: dict, text: str):
+    """
+    То же, что send_row_with_image, но используется, когда у нас уже есть bot и chat_id.
+    """
     code = str(row.get("код", "")).strip().lower()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]])
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📦 Взять деталь", callback_data=f"issue:{code}")]]
+    )
+
     url_raw = await data.find_image_by_code_async(code)
     if not url_raw:
         logger.info(f"[image] нет записи в индексе для кода: {code}")
-        return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
+        return await _safe_send_html_message(
+            bot,
+            chat_id,
+            "📄 (без фото)\n" + text,
+            reply_markup=kb,
+        )
+
     url = await data.resolve_image_url_async(url_raw)
     if not url:
         logger.info(f"[image] резолв не прошёл для кода {code}: {url_raw}")
-        return await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
+        return await _safe_send_html_message(
+            bot,
+            chat_id,
+            "📄 (без фото)\n" + text,
+            reply_markup=kb,
+        )
+
     sent = await _send_photo_with_fallback(bot, chat_id, url, text, kb)
-    if sent: return
+    if sent:
+        return
+
     logger.warning(f"[image] не удалось отправить фото (bot) для кода {code} (url={url})")
-    await bot.send_message(chat_id=chat_id, text="📄 (без фото)\n" + text, reply_markup=kb)
+    await _safe_send_html_message(
+        bot,
+        chat_id,
+        "📄 (без фото)\n" + text,
+        reply_markup=kb,
+    )
 
 # --------------------- Меню (callbacks) -----------------
 async def menu_search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    msg = "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\nПример: <code>PI 8808 DRG 500</code>"
+    q = update.callback_query
+    await q.answer()
+    msg = (
+        "🔍 Введите запрос: <i>название</i>/<i>модель</i>/<i>код</i>.\n"
+        "Пример: <code>PI 8808 DRG 500</code>"
+    )
     await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
+
 async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     msg = (
         "<b>Как списать деталь</b>:\n"
         "1) Выполните поиск по названию/коду.\n"
@@ -234,15 +348,20 @@ async def menu_issue_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     await _safe_send_html_message(context.bot, q.message.chat_id, msg)
 
+
 async def menu_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     await q.message.reply_text(f"{SUPPORT_CONTACT}")
 
 # --------------------- Команды -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    data.issue_state.pop(uid, None); data.user_state.pop(uid, None)
+    data.issue_state.pop(uid, None)
+    data.user_state.pop(uid, None)
+
     await send_welcome_sequence(update, context)
+
     if update.message:
         await asyncio.sleep(0.2)
         cmds_html = (
@@ -255,6 +374,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await _safe_send_html_message(context.bot, update.effective_chat.id, cmds_html)
 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "<b>Как пользоваться</b>:\n"
@@ -265,12 +385,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await _safe_send_html_message(context.bot, update.effective_chat.id, msg)
 
+
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return await update.message.reply_text("Доступ запрещён.")
-    data.ensure_fresh_data(force=True); ensure_users(force=True)
+    data.ensure_fresh_data(force=True)
+    ensure_users(force=True)
     await update.message.reply_text("✅ Данные и пользователи перезагружены (в фоне).")
+
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -279,12 +402,14 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Нет активной операции.")
 
+
 async def export_cmd(update: Update, Context):
     uid = update.effective_user.id
     st = data.user_state.get(uid, {})
     results = st.get("results")
     if results is None or results.empty:
         return await update.message.reply_text("Сначала выполните поиск.")
+
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
@@ -300,7 +425,8 @@ async def export_cmd(update: Update, Context):
 # --------------------- Поиск -----------------
 async def send_page(update: Update, uid: int):
     st = data.user_state.get(uid, {})
-    results = st.get("results"); page = st.get("page", 0)
+    results = st.get("results")
+    page = st.get("page", 0)
 
     total = len(results)
     if total == 0:
@@ -310,7 +436,8 @@ async def send_page(update: Update, uid: int):
         st["page"] = pages - 1
         return await update.message.reply_text("Больше результатов нет.")
 
-    start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
 
     await update.message.reply_text(f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
     for _, row in results.iloc[start:end].iterrows():
@@ -318,9 +445,12 @@ async def send_page(update: Update, uid: int):
     if end < total:
         await update.message.reply_text("Показать ещё?", reply_markup=more_markup())
 
+
 async def send_page_via_bot(bot, chat_id: int, uid: int):
     st = data.user_state.get(uid, {})
-    results = st.get("results"); page = st.get("page", 0)
+    results = st.get("results")
+    page = st.get("page", 0)
+
     total = len(results)
     if total == 0:
         return await bot.send_message(chat_id=chat_id, text="Результатов больше нет.")
@@ -328,12 +458,16 @@ async def send_page_via_bot(bot, chat_id: int, uid: int):
     if page >= pages:
         st["page"] = pages - 1
         return await bot.send_message(chat_id=chat_id, text="Больше результатов нет.")
-    start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
+
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+
     await bot.send_message(chat_id=chat_id, text=f"Стр. {page+1}/{pages}. Показываю {start + 1}–{end} из {total}.")
     for _, row in results.iloc[start:end].iterrows():
         await send_row_with_image_bot(bot, chat_id, row.to_dict(), data.format_row(row.to_dict()))
     if end < total:
         await bot.send_message(chat_id=chat_id, text="Показать ещё?", reply_markup=more_markup())
+
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
@@ -414,7 +548,13 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сортировка по релевантности
     scores = []
     for _, r in results_df.iterrows():
-        scores.append(data._relevance_score(r.to_dict(), tokens + ([norm_code] if norm_code else []), q_squash))
+        scores.append(
+            data._relevance_score(
+                r.to_dict(),
+                tokens + ([norm_code] if norm_code else []),
+                q_squash
+            )
+        )
     results_df["__score"] = scores
 
     if "код" in results_df.columns:
@@ -428,9 +568,12 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results_df = results_df.drop(columns="__score")
 
     st = data.user_state.setdefault(uid, {})
-    st["query"] = q; st["results"] = results_df; st["page"] = 0
+    st["query"] = q
+    st["results"] = results_df
+    st["page"] = 0
 
     await send_page(update, uid)
+
 
 async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -443,7 +586,8 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ Списание -----------------
 async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     code = q.data.split(":", 1)[1].strip().lower()
 
@@ -460,6 +604,7 @@ async def on_issue_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text("Сколько списать? Укажите число (например: 1 или 2.5).", reply_markup=cancel_markup())
     return data.ASK_QUANTITY
 
+
 async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
     uid = update.effective_user.id
@@ -474,12 +619,19 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Введите число > 0 и ≤ {MAX_QTY}. Пример: 1 или 2.5",
             reply_markup=cancel_markup()
         )
+
     st = data.issue_state.get(uid)
     if not st or "part" not in st:
         return await update.message.reply_text("Списание неактивно — начните заново из карточки.")
-    st["quantity"] = qty; st["await_comment"] = True
-    await update.message.reply_text("Добавьте комментарий (например: Линия сборки CSS OP-1100).", reply_markup=cancel_markup())
+
+    st["quantity"] = qty
+    st["await_comment"] = True
+    await update.message.reply_text(
+        "Добавьте комментарий (например: Линия сборки CSS OP-1100).",
+        reply_markup=cancel_markup()
+    )
     return data.ASK_COMMENT
+
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["suppress_next_search"] = True
@@ -489,7 +641,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not st:
         return await update.message.reply_text("Списание неактивно. Начните заново из карточки.")
 
-    part = st.get("part"); qty = st.get("quantity")
+    part = st.get("part")
+    qty = st.get("quantity")
     if part is None or qty is None:
         data.issue_state.pop(uid, None)
         return await update.message.reply_text("Что-то пошло не так. Попробуйте ещё раз.")
@@ -506,9 +659,11 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=confirm_markup())
     return data.ASK_CONFIRM
 
+
 async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     from app.config import SPREADSHEET_URL
     import gspread
+
     client = data.get_gs_client()
     sh = client.open_by_url(SPREADSHEET_URL)
     try:
@@ -516,11 +671,15 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="История", rows=1000, cols=12)
         ws.append_row(["Дата", "ID", "Имя", "Тип", "Наименование", "Код", "Количество", "Коментарий"])
-    headers_raw = ws.row_values(1); headers = [h.strip() for h in headers_raw]; norm = [h.lower() for h in headers]
+
+    headers_raw = ws.row_values(1)
+    headers = [h.strip() for h in headers_raw]
+    norm = [h.lower() for h in headers]
 
     full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
     display_name = full_name or (f"@{user.username}" if user.username else str(user.id))
     ts = data.now_local_str()
+
     values_by_key = {
         "дата": ts, "timestamp": ts,
         "id": user.id, "user_id": user.id,
@@ -535,17 +694,24 @@ async def save_issue_to_sheet(bot, user, part: dict, quantity, comment: str):
     ws.append_row(row, value_input_option="USER_ENTERED")
     logger.info("💾 Списание записано в 'История'")
 
+
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
+
     if q.data == "confirm_yes":
         st = data.issue_state.get(uid)
         if not st or "part" not in st or "quantity" not in st:
             data.issue_state.pop(uid, None)
             return await q.message.reply_text("Данных для списания нет. Начните заново.")
-        part = st["part"]; qty = st["quantity"]; comment = st.get("comment", "")
+        part = st["part"]
+        qty = st["quantity"]
+        comment = st.get("comment", "")
+
         await save_issue_to_sheet(context.bot, q.from_user, part, qty, comment)
         data.issue_state.pop(uid, None)
+
         await q.message.reply_text(
             f"✅ Списано: {qty}\n"
             f"🔢 Код: {data.val(part, 'код')}\n"
@@ -553,25 +719,31 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 Комментарий: {comment or '—'}"
         )
         return ConversationHandler.END
+
     if q.data == "confirm_no":
         data.issue_state.pop(uid, None)
         await q.message.reply_text("❌ Списание отменено.")
         return ConversationHandler.END
 
+
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     if uid in data.issue_state:
         data.issue_state.pop(uid, None)
         await q.message.reply_text("❌ Операция списания отменена.")
     return ConversationHandler.END
 
+
 async def handle_cancel_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cancel_cmd(update, context)
     return ConversationHandler.END
 
+
 async def on_more_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     st = data.user_state.get(uid, {})
     results = st.get("results")
@@ -598,7 +770,10 @@ def register_handlers(app):
     # Новый хендлер для получения file_id
     app.add_handler(CommandHandler("getfileid", getfileid_cmd))
     app.add_handler(
-        MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL), media_fileid_handler),
+        MessageHandler(
+            (filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL),
+            media_fileid_handler
+        ),
         group=0
     )
 
