@@ -1,33 +1,51 @@
 import logging
+
 from telegram.ext import ApplicationBuilder
-from telegram.constants import ParseMode   # <<< добавлено
-from app.config import TELEGRAM_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, PORT, WEBHOOK_SECRET_TOKEN, TZ_NAME
+from telegram.constants import ParseMode
+
+from app.config import (
+    TELEGRAM_TOKEN,
+    WEBHOOK_URL,
+    WEBHOOK_PATH,
+    PORT,
+    WEBHOOK_SECRET_TOKEN,
+    TZ_NAME,
+)
 from app.data import initial_load
 from app.handlers import register_handlers
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 logger = logging.getLogger("bot")
 
-def main():
+
+def main() -> None:
     logger.info(f"⌚ Используем часовой пояс: {TZ_NAME}")
 
-    # Проверка секретного токена для вебхука
-    if not WEBHOOK_SECRET_TOKEN:  # <<< исправлено, убран комментарий "добавь сам"
-        logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется включить для продакшена.")
+    # Предупреждение, если нет секретного токена вебхука
+    if not WEBHOOK_SECRET_TOKEN:
+        logger.warning(
+            "WEBHOOK_SECRET_TOKEN не задан — "
+            "рекомендуется включить для продакшена."
+        )
 
-    # Начальная синхронная загрузка данных
+    # Начальная синхронная загрузка данных (таблица + пользователи)
     initial_load()
 
-    # <<< ВАЖНО: включаем HTML по умолчанию
+    # Строим приложение и сразу включаем HTML-разметку
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .parse_mode(ParseMode.HTML)   # <<< теперь бот отправляет HTML-карточки как нужно
+        .parse_mode(ParseMode.HTML)   # <<< важно для <b>...</b> в карточках
         .build()
     )
 
+    # Регистрируем все хендлеры
     register_handlers(app)
 
+    # Настройка вебхука
     full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     logger.info(f"🚀 Стартуем webhook-сервер на 0.0.0.0:{PORT}")
     logger.info(f"🌐 Устанавливаем webhook: {full_webhook}")
@@ -42,6 +60,6 @@ def main():
         allowed_updates=None,
     )
 
+
 if __name__ == "__main__":
-    main(
-    
+    main()
