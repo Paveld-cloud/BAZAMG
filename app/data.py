@@ -29,7 +29,15 @@ except Exception:
     SAP_SHEET_NAME = os.getenv("SAP_SHEET_NAME", "SAP")
     USERS_SHEET_NAME = os.getenv("USERS_SHEET_NAME", "Пользователи")
     DATA_TTL = int(os.getenv("DATA_TTL", "600"))
-    SEARCH_COLUMNS = ["тип", "наименование", "код", "oem", "изготовитель", "парт номер", "oem парт номер"]
+    SEARCH_COLUMNS = [
+        "тип",
+        "наименование",
+        "код",
+        "oem",
+        "изготовитель",
+        "парт номер",
+        "oem парт номер",
+    ]
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -102,15 +110,21 @@ def normalize(text: str) -> str:
 # ---------- Форматирование цены ----------
 def _format_price(raw) -> str:
     """
-    Очень аккуратное форматирование цены:
-    - если уже есть запятая — ничего не меняем;
-    - если есть одна точка и до 2 цифр после неё — меняем точку на запятую;
+    Форматирование цены под вид из Google Sheets:
+
+    - если уже есть запятая — оставляем как есть;
+    - если есть одна точка и до 2 цифр после неё — точку меняем на запятую;
+    - если только цифры и длина > 2 — последние 2 цифры считаем копейками
+      (10046 -> 100,46; 57390 -> 573,90);
     - иначе возвращаем как есть.
-    Никаких разделителей тысяч и добавления нулей.
+    Никаких пробелов и разделителей тысяч.
     """
     s = str(raw or "").strip()
     if not s:
         return ""
+
+    # убираем пробелы, если кто-то их поставил
+    s = s.replace(" ", "")
 
     # Уже "русский" формат – не трогаем
     if "," in s:
@@ -119,10 +133,23 @@ def _format_price(raw) -> str:
     # Формат вроде 100.46 -> 100,46 или 573.9 -> 573,9
     if s.count(".") == 1:
         left, right = s.split(".")
-        if right.isdigit() and len(right) <= 2:
-            return left + "," + right
+        if left.replace("-", "").isdigit() and right.isdigit() and len(right) <= 2:
+            return f"{left},{right}"
 
-    # Всё остальное – как есть
+    # Только цифры, без точки и запятой — считаем, что последние две цифры это копейки
+    if s.isdigit():
+        if len(s) <= 2:
+            # 5 -> "5", 50 -> "50" (если вдруг действительно такие цены)
+            return s
+        left, right = s[:-2], s[-2:]
+        # убираем ведущие нули в целой части, но оставляем хотя бы "0"
+        try:
+            left = str(int(left)) if left else "0"
+        except ValueError:
+            left = left or "0"
+        return f"{left},{right}"
+
+    # Всё остальное — как есть
     return s
 
 
