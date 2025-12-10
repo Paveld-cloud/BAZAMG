@@ -98,6 +98,34 @@ def squash(text: str) -> str:
 def normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
 
+
+# ---------- Форматирование цены ----------
+def _format_price(raw) -> str:
+    """
+    Очень аккуратное форматирование цены:
+    - если уже есть запятая — ничего не меняем;
+    - если есть одна точка и до 2 цифр после неё — меняем точку на запятую;
+    - иначе возвращаем как есть.
+    Никаких разделителей тысяч и добавления нулей.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+
+    # Уже "русский" формат – не трогаем
+    if "," in s:
+        return s
+
+    # Формат вроде 100.46 -> 100,46 или 573.9 -> 573,9
+    if s.count(".") == 1:
+        left, right = s.split(".")
+        if right.isdigit() and len(right) <= 2:
+            return left + "," + right
+
+    # Всё остальное – как есть
+    return s
+
+
 # ---------- Формат карточки ----------
 def format_row(row: dict) -> str:
     """
@@ -110,7 +138,8 @@ def format_row(row: dict) -> str:
     part_no     = val(row, "парт номер")
     oem_part    = val(row, "oem парт номер")
     qty         = val(row, "количество") or "—"
-    price       = val(row, "цена")
+    raw_price   = row.get("цена", "")
+    price       = _format_price(raw_price)
     currency    = val(row, "валюта")
     manuf       = val(row, "изготовитель")
     oem         = val(row, "oem")
@@ -154,6 +183,7 @@ def format_row(row: dict) -> str:
 
     return "\n".join(lines)
 
+
 # ---------- Google Sheets ----------
 def get_gs_client():
     if not GOOGLE_APPLICATION_CREDENTIALS_JSON:
@@ -183,6 +213,7 @@ def _load_sap_dataframe() -> pd.DataFrame:
         new_df["image"] = new_df["image"].astype(str).str.strip()
 
     return new_df
+
 
 # ---------- Индексы ----------
 def build_search_index(df_: pd.DataFrame) -> Dict[str, Set[int]]:
@@ -243,6 +274,7 @@ def ensure_fresh_data(force: bool = False):
     _image_index = build_image_index(df)
     _last_load_ts = time.time()
     logger.info(f"✅ Перезагружено {len(df)} строк и построены индексы")
+
 
 # ---------- Картинки ----------
 async def find_image_by_code_async(code: str) -> str:
@@ -309,6 +341,7 @@ async def resolve_image_url_async(url_raw: str) -> str:
     url = normalize_drive_url(url_raw)
     url = await resolve_ibb_direct_async(url)
     return url
+
 
 # ---------- Поиск ----------
 def match_row_by_index(tokens: List[str]) -> Set[int]:
@@ -395,6 +428,7 @@ def _relevance_score(row: dict, tokens: List[str], q_squash: str) -> float:
 
     return score
 
+
 # ---------- Экспорт ----------
 def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
     buf = io.BytesIO()
@@ -402,6 +436,7 @@ def _df_to_xlsx(df_: pd.DataFrame, filename: str = "export.xlsx") -> io.BytesIO:
         df_.to_excel(writer, index=False)
     buf.seek(0)
     return buf
+
 
 # ---------- Пользователи ----------
 def _parse_int(x) -> Optional[int]:
@@ -502,11 +537,13 @@ def load_users_from_sheet() -> Tuple[Set[int], Set[int], Set[int]]:
 
     return allowed, admins, blocked
 
+
 # ---------- Async helper ----------
 import asyncio
 async def asyncio_to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
 
 # ---------- Backward-compat ----------
 def initial_load():
